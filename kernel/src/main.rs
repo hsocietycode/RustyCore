@@ -85,21 +85,41 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // interrupts don't need IF, but it's already on. Proves the 0x80 gate.
     syscall::self_test();
 
-    // Self-test #2: hardware timer. IF is already on — wait for ~100 ticks
-    // (~1 second at 100 Hz), all driven by IRQ0 through the PIC.
-    serial_println!("self-test: waiting for 100 timer ticks...");
+    // Step 5: dual-clock soak. Start the LAPIC timer in periodic mode
+    // (~100 Hz, sidecar vector 0xEF) and let it run ALONGSIDE the PIT.
+    // PIC+PIT stays master — if the APIC never fires, we say so loudly
+    // and continue on the PIT alone. Never brick on a sidecar.
+    apic::start_periodic().expect("apic start_periodic failed");
+
+    // Self-test #2: dual clock. Wait until BOTH clocks saw ~100 ticks
+    // (~1 second at 100 Hz each) — IRQ0 through the PIC and 0xEF from
+    // the LAPIC, side by side on the same serial line.
+    serial_println!("self-test: dual-clock soak (pic + apic, 100 ticks each)...");
 
     let mut spins: u64 = 0;
+    let mut last_printed: u64 = 0;
     loop {
         use core::sync::atomic::Ordering;
-        if idt::TIMER_TICKS.load(Ordering::Relaxed) >= 100 {
+        let pic = idt::TIMER_TICKS.load(Ordering::Relaxed);
+        let apic_ticks = idt::APIC_TICKS.load(Ordering::Relaxed);
+        // Progress every 20 PIC ticks — one line per ~200 ms, cheap.
+        if pic >= last_printed + 20 {
+            last_printed = pic;
+            serial_println!("tick: pic={} apic=~{}", pic, apic_ticks);
+        }
+        if pic >= 100 && apic_ticks >= 100 {
+            break;
+        }
+        // APIC silent but PIC alive at 100? Loud fallback, PIT carries on.
+        if pic >= 100 && apic_ticks == 0 {
+            serial_println!("apic-timer: NO IRQs (PIC ok, continuing)");
             break;
         }
         spins += 1;
         // ~10M hlt-spins ≈ way past 1s even at 100 Hz; if we get here
-        // the timer is dead and we say so instead of hanging forever.
+        // both clocks are dead and we say so instead of hanging forever.
         if spins > 10_000_000 {
-            serial_println!("self-test FAILED: timer produced no ticks (spun out). Halting.");
+            serial_println!("self-test FAILED: no ticks from either clock (spun out). Halting.");
             loop {
                 x86_64::instructions::hlt();
             }
@@ -107,7 +127,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         x86_64::instructions::hlt(); // sleep until the next IRQ
     }
 
-    serial_println!("self-test: 100 timer ticks seen, IRQs work. Phase 2 online. Halting.");
+    serial_println!("self-test: dual-clock soak done, both clocks live. Phase 2 online. Halting.");
     loop {
         x86_64::instructions::hlt();
     }

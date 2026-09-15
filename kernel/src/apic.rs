@@ -180,7 +180,6 @@ static TICKS_PER_10MS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 /// Calibrated ticks per ~10 ms window (`0` = not calibrated yet).
 /// Step 5 programs the periodic rate from this; a zero means
 /// [`calibrate`] failed and the APIC timer stays off.
-#[allow(dead_code)] // consumed by Step 5 (dual-clock soak) — not yet written
 pub fn ticks_per_10ms() -> u64 {
     TICKS_PER_10MS.load(core::sync::atomic::Ordering::Relaxed)
 }
@@ -276,6 +275,41 @@ pub fn calibrate() -> Result<u64, &'static str> {
         );
         Ok(per_10ms)
     }
+}
+
+/// Start the LAPIC timer in periodic mode (Step 5).
+///
+/// Programs LVT entry `0x320 = vector | periodic(1<<17) | unmasked` with
+/// the 0xEF sidecar vector registered in Step 2, sets ICR to one 10 ms
+/// quantum from [`ticks_per_10ms`], and returns. From here the LAPIC fires
+/// IRQ 0xEF every ~10 ms alongside the PIT's IRQ0 — the dual-clock soak.
+///
+/// # Errors
+/// `Err` when the window is unmapped (before [`init`]) or the rate is
+/// zero (calibration failed) — a zero ICR would fire continuously and
+/// livelock the kernel, so refusal is the only safe shape.
+pub fn start_periodic() -> Result<u64, &'static str> {
+    use core::sync::atomic::Ordering;
+    let win = LAPIC_VIRT.load(Ordering::Relaxed);
+    if win == 0 {
+        return Err("apic: start_periodic before init — LAPIC window not mapped");
+    }
+    let quantum = ticks_per_10ms();
+    if quantum == 0 || quantum > u32::MAX as u64 {
+        return Err("apic: no calibrated rate — refusing to program a zero/huge ICR");
+    }
+    let reg = |off: u64| lapic_reg(win, off);
+    unsafe {
+        // LVT timer: vector 0xEF, periodic mode, unmasked.
+        // (Delivery mode bits are 0 = fixed; mask bit 16 CLEAR to unmask.)
+        core::ptr::write_volatile(reg(LVT_TIMER_OFFSET)?, 0xEF | (1 << 17));
+        core::ptr::write_volatile(reg(ICR_OFFSET)?, quantum as u32);
+    }
+    crate::serial_println!(
+        "apic-timer: periodic @ ~100 Hz (icr={} / 10ms quantum)",
+        quantum
+    );
+    Ok(quantum)
 }
 
 /// End-of-interrupt to the local APIC: write 0 to the EOI register.
