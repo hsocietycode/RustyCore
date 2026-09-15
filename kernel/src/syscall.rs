@@ -7,7 +7,8 @@
 use core::sync::atomic::Ordering;
 
 /// Fire `int 0x80` twice; the handler prints `count=1` then `count=2`.
-/// Call with IF=1 after the IDT is loaded.
+/// Call after the IDT is loaded; IF=0 is fine — a software-raised `int`
+/// does not need the interrupt flag (only hardware IRQs do).
 pub fn self_test() {
     crate::serial_println!("self-test: firing int 0x80 (syscall stub)...");
     unsafe {

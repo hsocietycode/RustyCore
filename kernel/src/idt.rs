@@ -131,7 +131,7 @@ extern "x86-interrupt" fn syscall_stub_handler(_stack_frame: InterruptStackFrame
     crate::serial_println!("syscall: stub hit count={}", n);
 }
 
-/// LAPIC timer ( Step 5 fires this). Counts ticks, then EOI straight to the
+/// LAPIC timer (Step 5 fires this). Counts ticks, then EOI straight to the
 /// local APIC — the 8259 never sees LAPIC vectors, so no PIC ack here.
 ///
 /// Cannot fire before Step 5 by hardware contract: LVT entries reset masked

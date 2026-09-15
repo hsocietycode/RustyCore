@@ -84,24 +84,32 @@ pub fn probe(boot_info: &BootInfo) -> Probe {
 /// End-of-interrupt to the local APIC: write 0 to the EOI register.
 ///
 /// The MMIO base comes from the Step-1 probe (MSR truth, not a hardcoded
-/// constant). Until Step 3 maps it, the phys-offset mapping already covers
-/// it — the bootloader maps all RAM there, and the LAPIC window is
-/// addressable through it on q35.
+/// constant). The LAPIC window is MMIO, NOT RAM — the phys-offset mapping
+/// does not cover it until Step 3 explicitly maps the page. Calling this
+/// before Step 3 #PFs (loud, with the faulting address); by hardware reset
+/// contract (LVT masked, SVR disabled) no handler can reach it that early.
 ///
 /// # Safety
 /// Caller must be the LAPIC timer/error handler (or Step-5 bring-up):
 /// writing EOI with no interrupt in service is harmless, but writing to a
-/// wrong address is not. Only call after `probe()` confirmed presence.
+/// wrong address is not. Only call after `probe()` confirmed presence AND
+/// Step 3 mapped the window.
 pub fn eoi() {
     use x86_64::registers::model_specific::Msr;
     // SAFETY: read-only MSR query (see probe).
     let msr = unsafe { Msr::new(IA32_APIC_BASE).read() };
     let base = msr & 0xFFFF_F000_0000;
     let base = if base == 0 { FALLBACK_BASE } else { base };
+    // Checked arithmetic on purpose: a garbage MSR base must panic here
+    // with the address in the message, never wrap (release) into a write
+    // to somebody else's memory from inside an interrupt handler.
+    let addr = crate::memory::PHYS_MEM_OFFSET
+        .checked_add(base)
+        .and_then(|a| a.checked_add(EOI_OFFSET))
+        .unwrap_or_else(|| panic!("apic: EOI address overflow (base={base:#x})"));
     // SAFETY: EOI is write-only-0 by spec; the address is the probed
-    // LAPIC base + 0xB0, mapped via the phys-offset window.
+    // LAPIC base + 0xB0, mapped by Step 3 (see doc above).
     unsafe {
-        let eoi = (crate::memory::PHYS_MEM_OFFSET + base + EOI_OFFSET) as *mut u32;
-        core::ptr::write_volatile(eoi, 0);
+        core::ptr::write_volatile(addr as *mut u32, 0);
     }
 }
