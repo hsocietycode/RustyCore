@@ -15,6 +15,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - name: xtask (host)
         run: cargo clippy -p xtask --all-targets -- -D warnings
+      - name: kernel clippy (no_std target only — no --all-targets: bare-metal has no test harness)
+        run: cargo clippy -p rustycore-kernel --target x86_64-unknown-none -- -D warnings
       - name: kernel debug
         run: cargo check -p rustycore-kernel --target x86_64-unknown-none
       - name: kernel release (opt3, LTO fat)

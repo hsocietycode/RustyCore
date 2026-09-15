@@ -19,9 +19,25 @@ fn main() {
             continue;
         }
         if let Some((k, v)) = line.split_once('=') {
-            let k = k.trim().replace('-', "_").replace('.', "_");
-            let v = v.trim().trim_matches('"').to_string();
-            println!("cargo:rustc-env=KERNEL_CONFIG_{}={}", k.to_uppercase(), v);
+            let k = k.trim().replace(['-', '.'], "_");
+            let v = v
+                .trim()
+                .trim_matches('"')
+                .trim_end_matches("KB")
+                .trim()
+                .to_string();
+            let upper = k.to_uppercase();
+            println!("cargo:rustc-env=KERNEL_CONFIG_{upper}={v}");
+            // Export heap size in BYTES for `env!` parsing (u64 from digits only).
+            if upper == "HEAP_SIZE_KB" {
+                let kb: u64 = v.parse().unwrap_or_else(|_| {
+                    panic!("kernel_config.toml: heap_size_kb must be a plain number, got {v:?}")
+                });
+                println!(
+                    "cargo:rustc-env=KERNEL_CONFIG_HEAP_SIZE_BYTES={}",
+                    kb * 1024
+                );
+            }
         }
     }
 }

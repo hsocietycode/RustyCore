@@ -3,6 +3,10 @@
 //! The bootloader maps all physical memory at [`PHYS_MEM_OFFSET`] and hands
 //! us the memory map. Usable regions feed the frame allocator; a slice of
 //! mapped frames becomes the kernel heap.
+//!
+//! Which allocator backs this is chosen at compile time via Cargo features:
+//! `alloc-bump` (bring-up, no reclaim) or `alloc-buddy` (production).
+//! Heap size comes from `config/kernel_config.toml` (`heap_size_kb`).
 
 mod bump;
 mod heap;
@@ -21,44 +25,97 @@ use x86_64::{
 /// (see `BOOTLOADER_CONFIG` in main.rs — must match).
 pub const PHYS_MEM_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 
-/// Kernel heap: virtual start + size. Backed by freshly allocated frames.
+/// Kernel heap: virtual start + size in bytes (wired from `heap_size_kb` in
+/// `config/kernel_config.toml` by build.rs — a stale literal here would be a lie).
 pub const HEAP_START: u64 = 0xFFFF_9000_0000_0000;
-pub const HEAP_SIZE: usize = 1024 * 1024; // 1 MiB — heap_size_kb from kernel_config.toml
+pub const HEAP_SIZE: usize = parse_heap_bytes();
+
+/// `const` decimal parser for the build-time heap-size-bytes env string.
+const fn parse_heap_bytes() -> usize {
+    let s = env!("KERNEL_CONFIG_HEAP_SIZE_BYTES").as_bytes();
+    let mut n: usize = 0;
+    let mut i = 0;
+    while i < s.len() {
+        let d = s[i].wrapping_sub(b'0');
+        assert!(d < 10, "heap_size_kb must be digits");
+        n = n * 10 + d as usize;
+        i += 1;
+    }
+    n
+}
 
 /// Initialize frame allocator + heap, print a memory summary.
 pub fn init(boot_info: &'static mut BootInfo) {
-    let phys_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().expect(
-        "physical_memory_offset missing — is mappings.physical_memory set in BOOTLOADER_CONFIG?",
-    ));
+    // Honesty gate, enforced at COMPILE time: `alloc-buddy` isn't
+    // implemented yet — selecting it (or nothing, or both) refuses to
+    // build instead of silently booting the wrong allocator.
+    #[cfg(all(feature = "alloc-bump", feature = "alloc-buddy"))]
+    compile_error!("select exactly one of alloc-bump / alloc-buddy, not both");
+    #[cfg(not(any(feature = "alloc-bump", feature = "alloc-buddy")))]
+    compile_error!("select one of alloc-bump / alloc-buddy");
+    #[cfg(all(feature = "alloc-buddy", not(feature = "alloc-bump")))]
+    compile_error!("alloc-buddy is selected but not implemented yet — build with alloc-bump");
+
+    let phys_offset = VirtAddr::new(
+        boot_info
+            .physical_memory_offset
+            .into_option()
+            .expect("physical_memory_offset missing — is mappings.physical_memory set?"),
+    );
+    assert_eq!(
+        phys_offset.as_u64(),
+        PHYS_MEM_OFFSET,
+        "bootloader phys offset drifted from PHYS_MEM_OFFSET"
+    );
 
     let mut mapper = unsafe { mapper(phys_offset) };
     let mut frame_allocator = unsafe { BootFrameAllocator::new(&boot_info.memory_regions) };
 
     heap::init(&mut mapper, &mut frame_allocator).expect("heap init failed");
 
-    let usable_bytes: u64 = boot_info
-        .memory_regions
-        .iter()
-        .filter(|r| r.kind == MemoryRegionKind::Usable)
-        .map(|r| r.end - r.start)
-        .sum();
+    let (usable_bytes, usable_regions) = usable_summary(&boot_info.memory_regions);
     crate::serial_println!(
-        "memory: {} MiB usable, heap {} KiB at {:#x}, phys offset {:#x}",
+        "memory: {} MiB usable in {} regions, heap {} KiB at {:#x}, phys offset {:#x}",
         usable_bytes / 1024 / 1024,
+        usable_regions,
         HEAP_SIZE / 1024,
         HEAP_START,
         phys_offset.as_u64(),
     );
 
-    // Smoke test: Box + Vec prove the heap actually works.
-    let b = alloc::boxed::Box::new(0xC0FFEEu64);
+    self_test(boot_info.memory_regions.len() as u64);
+}
+
+/// Sum usable RAM with saturating math — garbage firmware tables must not
+/// wrap the counter around to zero.
+fn usable_summary(regions: &[bootloader_api::info::MemoryRegion]) -> (u64, usize) {
+    let mut bytes: u64 = 0;
+    let mut count = 0;
+    for r in regions
+        .iter()
+        .filter(|r| r.kind == MemoryRegionKind::Usable)
+    {
+        bytes = bytes.saturating_add(r.end.saturating_sub(r.start));
+        count += 1;
+    }
+    (bytes, count)
+}
+
+/// Heap self-test: Box + Vec prove allocation, growth, and values work.
+/// Runs at every boot — a broken heap must scream, never limp along.
+fn self_test(region_count: u64) {
+    let b = alloc::boxed::Box::new(0xC0F_FEEu64);
     let mut v = alloc::vec::Vec::new();
     v.push(*b);
-    v.push(boot_info.memory_regions.len() as u64);
+    v.push(region_count);
+    v.extend(0..64u64);
+    assert_eq!(v[0], 0xC0F_FEE, "heap readback mismatch");
+    assert_eq!(v.len(), 66, "heap vec length mismatch");
+    let sum: u64 = v.iter().sum();
     crate::serial_println!(
-        "memory: heap smoke test ok (box={:#x}, vec_len={})",
-        v[0],
-        v.len()
+        "memory: heap self-test ok (len={}, sum={:#x})",
+        v.len(),
+        sum
     );
 }
 
@@ -72,26 +129,37 @@ unsafe fn mapper(phys_offset: VirtAddr) -> OffsetPageTable<'static> {
     unsafe { OffsetPageTable::new(&mut *table, phys_offset) }
 }
 
-/// Allocate frames backing `[start, start + size)` and map them into the heap area.
+/// Allocate frames backing `[start, start + size)` and map them.
+///
+/// # Errors
+/// `Err` when frames run out or a target page is already mapped —
+/// callers must fail boot loudly rather than continue half-mapped.
 pub fn map_heap(
     mapper: &mut OffsetPageTable,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     start: u64,
     size: usize,
-) {
+) -> Result<(), &'static str> {
     use x86_64::structures::paging::PageTableFlags;
+    if size == 0 {
+        return Err("heap size is zero");
+    }
+    let end_addr = start
+        .checked_add(size as u64)
+        .ok_or("heap range overflows")?;
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
     let start_page = Page::<Size4KiB>::containing_address(VirtAddr::new(start));
-    let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(start + size as u64 - 1));
+    let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(end_addr - 1));
     for page in Page::range_inclusive(start_page, end_page) {
         let frame: PhysFrame<Size4KiB> = frame_allocator
             .allocate_frame()
-            .expect("out of frames for heap");
+            .ok_or("out of frames for heap")?;
         unsafe {
             mapper
                 .map_to(page, frame, flags, frame_allocator)
-                .expect("heap map_to failed")
+                .map_err(|_| "heap page already mapped")?
                 .flush();
         }
     }
+    Ok(())
 }

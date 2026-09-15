@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["arch-x86_64", "sched-rr", "alloc-buddy", "drv-uart"]
+# NOTE: default is alloc-bump — alloc-buddy doesn't exist yet and the
+# kernel fails the build loudly if it is selected (see memory::init).
+default = ["arch-x86_64", "sched-rr", "alloc-bump", "drv-uart"]
 arch-x86_64 = []
 sched-rr = []
 sched-cfs = []
