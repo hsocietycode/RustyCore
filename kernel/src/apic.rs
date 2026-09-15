@@ -96,6 +96,10 @@ const VER_OFFSET: u64 = 0x30;
 const TPR_OFFSET: u64 = 0x80;
 const SVR_OFFSET: u64 = 0xF0;
 const LVT_TIMER_OFFSET: u64 = 0x320;
+/// Timer divide config (0x3E0), initial count (0x380), current count (0x390).
+const DCR_OFFSET: u64 = 0x3E0;
+const ICR_OFFSET: u64 = 0x380;
+const CCR_OFFSET: u64 = 0x390;
 
 /// Map + enable the local APIC (Step 3).
 ///
@@ -162,6 +166,93 @@ pub fn init(
 /// `eoi()` reads this instead of re-reading the MSR on every timer tick —
 /// cheaper, and immune to MSR-vs-mapping drift.
 static LAPIC_VIRT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Calibrated LAPIC-timer ticks per ~10 ms, stored by [`calibrate`].
+/// `0` = not calibrated yet. Read by Step 5 to program the periodic rate.
+static TICKS_PER_10MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Pure tick math for [`calibrate`]: APIC ticks elapsed during `pit_ticks`
+/// PIT ticks at `pit_hz`, scaled to a 10 ms window. Saturating + div0-guarded
+/// so garbage inputs yield 0 (Step 5 treats 0 as "calibration failed",
+/// never as a rate). Host-unit-testable: no MMIO, no globals.
+pub fn calibrate_ticks(delta: u32, pit_hz: u32, pit_ticks: u32) -> u64 {
+    if pit_hz == 0 || pit_ticks == 0 {
+        return 0;
+    }
+    // ticks_per_10ms = delta * (10ms worth of PIT ticks) / pit_ticks,
+    // where 10ms of PIT = pit_hz / 100. All u64, saturating.
+    let per_10ms = pit_hz as u64 / 100;
+    (delta as u64)
+        .saturating_mul(per_10ms)
+        .checked_div(pit_ticks as u64)
+        .unwrap_or(0)
+}
+
+/// Calibrate the LAPIC timer against the PIT ruler (Step 4).
+///
+/// One-shot, no LAPIC IRQs: DCR = divide-by-16, ICR = 0xFFFFFFFF, then
+/// sleep until `TIMER_TICKS` advances 10 PIT ticks (~100 ms at 100 Hz)
+/// and read CCR. Requires IF=1 (the PIT ruler advances via IRQ0) —
+/// main enables interrupts before calling. Stores `ticks_per_10ms`; prints the delta for the log. A zero
+/// delta (MMIO cached? DCR/ICR write lost?) is a loud `Err`, not a
+/// silent zero rate — Step 5 must never divide by it.
+///
+/// Call after [`init`] (window mapped) and `timer::init` (PIT ticking),
+/// with IF=0 or 1 — only the PIT counter is read, no LAPIC IRQ involved.
+pub fn calibrate() -> Result<u64, &'static str> {
+    use core::sync::atomic::Ordering;
+    let win = LAPIC_VIRT.load(Ordering::Relaxed);
+    if win == 0 {
+        return Err("apic: calibrate before init — LAPIC window not mapped");
+    }
+    let reg = |off: u64| -> Result<*mut u32, &'static str> {
+        win.checked_add(off)
+            .map(|a| a as *mut u32)
+            .ok_or("apic register address overflows")
+    };
+    unsafe {
+        // Divide-by-16: DCR bits 0,1,3 = 0b1011. One-shot mode: LVT masked
+        // already (Step 3), so the counter just runs down without firing.
+        core::ptr::write_volatile(reg(DCR_OFFSET)?, 0x3);
+        core::ptr::write_volatile(reg(ICR_OFFSET)?, 0xFFFF_FFFF);
+
+        let start = crate::idt::TIMER_TICKS.load(Ordering::Relaxed);
+        // ~100 ms of PIT, then a spin-out guard: 100M loop iterations is
+        // minutes of wall time — if the PIT is dead we say so instead of
+        // hanging. `hlt` (not spin_loop): the ruler advances via IRQ0,
+        // which needs IF=1 + a sleeping CPU to be observed promptly.
+        let mut spins: u64 = 0;
+        loop {
+            if crate::idt::TIMER_TICKS
+                .load(Ordering::Relaxed)
+                .wrapping_sub(start)
+                >= 10
+            {
+                break;
+            }
+            spins += 1;
+            if spins > 100_000_000 {
+                return Err("apic: PIT produced no ticks during calibration — timer dead?");
+            }
+            x86_64::instructions::hlt();
+        }
+
+        let cur = core::ptr::read_volatile(reg(CCR_OFFSET)? as *const u32);
+        let delta = 0xFFFF_FFFFu32.wrapping_sub(cur);
+        if delta == 0 {
+            return Err("apic: CCR delta is zero — MMIO writes lost (NO_CACHE missing?)");
+        }
+        // PIT is 100 Hz (see timer.rs): 10 ticks ≈ 100 ms ≈ 10 ms × 10.
+        let per_10ms = calibrate_ticks(delta, 100, 10);
+        TICKS_PER_10MS.store(per_10ms, Ordering::Relaxed);
+        crate::serial_println!(
+            "apic-timer: calibrate ccr_delta={} (~{} ticks/ms)",
+            delta,
+            per_10ms / 10
+        );
+        Ok(per_10ms)
+    }
+}
 
 /// End-of-interrupt to the local APIC: write 0 to the EOI register.
 ///

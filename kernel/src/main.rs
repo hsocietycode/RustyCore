@@ -63,20 +63,31 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     timer::init();
 
+    // IF=1 from here on: the IDT is fully loaded, the PIC is remapped, and
+    // Step 4 NEEDS hardware IRQs — the PIT ruler only advances via IRQ0.
+    // (int3/syscall self-tests below don't need IF, but IRQs enabled early
+    // is exactly the state Step 5 inherits.)
+    serial_println!("self-test: enabling interrupts...");
+    x86_64::instructions::interrupts::enable();
+
+    // Step 4: calibrate the LAPIC timer against the PIT ruler (one-shot,
+    // MMIO only — the LAPIC LVT stays masked, no APIC IRQ involved).
+    // Loud failure: no rate means Step 5 has nothing to program.
+    apic::calibrate().expect("apic calibrate failed");
+
     // Self-test #1: software breakpoint. If the IDT is wired right,
     // the handler prints the stack frame and we continue here.
     serial_println!("self-test: firing int3 breakpoint...");
     x86_64::instructions::interrupts::int3();
     serial_println!("self-test: breakpoint handler returned, IDT works.");
 
-    // Self-test #1b: syscall stub (Step 2). `int 0x80` twice, still IF=0 —
-    // software interrupts don't need the flag. Proves the 0x80 gate is live.
+    // Self-test #1b: syscall stub (Step 2). `int 0x80` twice — software
+    // interrupts don't need IF, but it's already on. Proves the 0x80 gate.
     syscall::self_test();
 
-    // Self-test #2: hardware timer. Enable IF, wait for ~100 ticks
+    // Self-test #2: hardware timer. IF is already on — wait for ~100 ticks
     // (~1 second at 100 Hz), all driven by IRQ0 through the PIC.
-    serial_println!("self-test: enabling interrupts, waiting for 100 timer ticks...");
-    x86_64::instructions::interrupts::enable();
+    serial_println!("self-test: waiting for 100 timer ticks...");
 
     let mut spins: u64 = 0;
     loop {
