@@ -1,9 +1,10 @@
-//! APIC probe (Step 1): read-only detection, zero hardware writes.
+//! APIC bring-up: probe → map → enable → calibrate (Steps 1–4).
 //!
-//! Checks CPUID for a local APIC, reads IA32_APIC_BASE (MSR 0x1B) for the
-//! MMIO base + enabled/BSP flags, and notes whether the bootloader gave us
-//! an RSDP (for MADT parsing in a later step). Nothing is mapped, nothing
-//! is enabled — the PIC+PIT path stays the one true clock.
+//! Step 1 is read-only detection (CPUID + IA32_APIC_BASE MSR). Step 3 maps
+//! the LAPIC MMIO page into [`crate::memory::MMIO_WINDOW`] and enables via
+//! SVR (LVT timer stays masked — PIC+PIT remains the one true clock until
+//! Step 5). Step 4 calibrates the LAPIC timer against the PIT ruler.
+//! Nothing here fires LAPIC interrupts yet — that is Step 5.
 
 use bootloader_api::BootInfo;
 use x86_64::{
@@ -32,12 +33,10 @@ pub struct Probe {
     /// CPUID.01H:EDX bit 9 — a local APIC exists.
     pub present: bool,
     /// MMIO base from IA32_APIC_BASE (or the q35 fallback if disabled).
-    /// Consumed by Step 3 (LAPIC mapping) — unused until then.
-    #[allow(dead_code)]
+    /// Consumed by Step 3 (LAPIC mapping).
     pub base: u64,
     /// IA32_APIC_BASE bit 11 — APIC globally enabled.
-    /// Consumed by Step 3 — unused until then.
-    #[allow(dead_code)]
+    /// Consumed by Step 3 (soft-disabled APIC is a loud Err).
     pub enabled: bool,
     /// IA32_APIC_BASE bit 8 — this CPU is the bootstrap processor.
     /// Consumed by the SMP step (Phase 4) — unused until then.
@@ -101,6 +100,18 @@ const DCR_OFFSET: u64 = 0x3E0;
 const ICR_OFFSET: u64 = 0x380;
 const CCR_OFFSET: u64 = 0x390;
 
+/// LAPIC register pointer: window base + offset, checked.
+///
+/// Single helper for `init`/`calibrate`/`eoi` so the checked-add discipline
+/// lives in one place. `Ok` addresses always land inside the mapped 4KiB
+/// window (all offsets are < 0x400); `Err` on overflow, never wrap.
+fn lapic_reg(win_base: u64, off: u64) -> Result<*mut u32, &'static str> {
+    win_base
+        .checked_add(off)
+        .map(|a| a as *mut u32)
+        .ok_or("apic register address overflows")
+}
+
 /// Map + enable the local APIC (Step 3).
 ///
 /// Maps the LAPIC MMIO page into the dedicated [`crate::memory::MMIO_WINDOW`]
@@ -130,14 +141,9 @@ pub fn init(
 
     // SAFETY: `base` is the mapped LAPIC window (one MMIO page); offsets
     // are architecturally fixed u32 registers. Volatile: the compiler must
-    // emit every read/write exactly once, in order. Checked arithmetic:
-    // a garbage probe base must Err here, never wrap into чужую memory.
-    let reg = |off: u64| -> Result<*mut u32, &'static str> {
-        base.as_u64()
-            .checked_add(off)
-            .map(|a| a as *mut u32)
-            .ok_or("apic register address overflows")
-    };
+    // emit every read/write exactly once, in order. Addresses go through
+    // `lapic_reg` — checked, never wrapping.
+    let reg = |off: u64| lapic_reg(base.as_u64(), off);
     unsafe {
         let svr = reg(SVR_OFFSET)?;
         core::ptr::write_volatile(svr, 0x1FF);
@@ -192,24 +198,25 @@ pub fn calibrate_ticks(delta: u32, pit_hz: u32, pit_ticks: u32) -> u64 {
 ///
 /// One-shot, no LAPIC IRQs: DCR = divide-by-16, ICR = 0xFFFFFFFF, then
 /// sleep until `TIMER_TICKS` advances 10 PIT ticks (~100 ms at 100 Hz)
-/// and read CCR. Requires IF=1 (the PIT ruler advances via IRQ0) —
-/// main enables interrupts before calling. Stores `ticks_per_10ms`; prints the delta for the log. A zero
-/// delta (MMIO cached? DCR/ICR write lost?) is a loud `Err`, not a
-/// silent zero rate — Step 5 must never divide by it.
+/// and read CCR.
 ///
-/// Call after [`init`] (window mapped) and `timer::init` (PIT ticking),
-/// with IF=0 or 1 — only the PIT counter is read, no LAPIC IRQ involved.
+/// Requires IF=1 — the PIT ruler advances via IRQ0, and with IF=0 the
+/// wait loop spins forever (no ticks ever arrive). Main enables
+/// interrupts before calling.
+///
+/// Stores `ticks_per_10ms`; prints the delta for the log. A zero delta
+/// (MMIO cached? DCR/ICR write lost?) is a loud `Err`, not a silent zero
+/// rate — Step 5 must never divide by it.
+///
+/// Call after [`init`] (window mapped) and `timer::init` (PIT ticking) —
+/// only the PIT counter is read, no LAPIC IRQ involved.
 pub fn calibrate() -> Result<u64, &'static str> {
     use core::sync::atomic::Ordering;
     let win = LAPIC_VIRT.load(Ordering::Relaxed);
     if win == 0 {
         return Err("apic: calibrate before init — LAPIC window not mapped");
     }
-    let reg = |off: u64| -> Result<*mut u32, &'static str> {
-        win.checked_add(off)
-            .map(|a| a as *mut u32)
-            .ok_or("apic register address overflows")
-    };
+    let reg = |off: u64| lapic_reg(win, off);
     unsafe {
         // Divide-by-16: DCR bits 0,1,3 = 0b1011. One-shot mode: LVT masked
         // already (Step 3), so the counter just runs down without firing.
@@ -270,9 +277,11 @@ pub fn eoi() {
     if win == 0 {
         panic!("apic: eoi before init — LAPIC window not mapped");
     }
-    // SAFETY: EOI is write-only-0 by spec; the address is the mapped
-    // MMIO window + 0xB0 (offsets < 4KiB, cannot overflow the page).
+    // SAFETY: EOI is write-only-0 by spec; the address goes through
+    // `lapic_reg` (checked — the last unchecked `+` in the APIC path).
+    // Offsets are < 4KiB, so Ok always lands inside the mapped window.
+    let eoi = lapic_reg(win, EOI_OFFSET).expect("apic: EOI address overflow");
     unsafe {
-        core::ptr::write_volatile((win + EOI_OFFSET) as *mut u32, 0);
+        core::ptr::write_volatile(eoi, 0);
     }
 }
