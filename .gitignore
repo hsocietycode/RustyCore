@@ -1,0 +1,13 @@
+/target/
+**/target/
+*.rs.bk
+Cargo.lock
+# keep xtask lock for reproducibility? uncomment to keep:
+# !xtask/Cargo.lock
+qemu.log
+*.img
+*.iso
+.vscode/
+.idea/
+*.swp
+.DS_Store

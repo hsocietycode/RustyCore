@@ -1,0 +1,26 @@
+[package]
+name = "rustycore-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["arch-x86_64", "sched-rr", "alloc-buddy", "drv-uart"]
+arch-x86_64 = []
+sched-rr = []
+sched-cfs = []
+alloc-bump = []
+alloc-buddy = []
+drv-uart = []
+drv-virtio = []
+opt-speed = []
+opt-size = []
+
+[dependencies]
+bootloader = "0.9"
+x86_64 = "0.14"
+uart_16550 = "0.3"
+spin = "0.9"
+pic8259 = "0.11"
+
+[build-dependencies]
+toml = "0.8"

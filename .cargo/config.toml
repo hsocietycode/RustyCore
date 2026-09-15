@@ -1,0 +1,8 @@
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+rustflags = ["-C", "target-cpu=x86-64-v2", "-C", "force-frame-pointers=no"]
+
+[unstable]
+build-std = ["core", "compiler_builtins"]

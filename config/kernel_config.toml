@@ -1,0 +1,31 @@
+# RustyCore kernel configuration — один файл для кастомизации сборки
+
+[arch]
+target = "x86_64-unknown-none"
+machine = "q35"
+cpu = "x86-64-v2" # v2 = совместимость везде; v3 = максимум перфа (AVX2)
+
+[sched]
+default = "rr" # rr | cfs
+quantum_us = 1000
+
+[memory]
+phys_offset = "0xFFFF800000000000"
+heap_size = "8M"
+stack_size = "128K"
+frame_allocator = "buddy" # bump | buddy
+
+[drivers]
+uart = true
+virtio = true
+ps2kbd = false
+
+[log]
+level = "info" # trace | debug | info | warn | error
+
+[qemu]
+memory = "512M"
+smp = 2
+display = "none"
+serial = "stdio"
+extra_args = "-no-reboot -no-shutdown"
