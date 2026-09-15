@@ -10,6 +10,10 @@ use spin::Mutex;
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 
+// SAFETY: `ChainedPics::new` is unsafe because the offsets program real
+// hardware — overlapping CPU exception vectors (0..=31) would route IRQs
+// into exception handlers and triple-fault. 32/40 are the standard
+// non-overlapping remap; `initialize()` performs the actual port I/O.
 pub static PICS: Mutex<ChainedPics> =
     Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 

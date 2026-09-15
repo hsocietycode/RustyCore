@@ -1,8 +1,12 @@
-# RustyCore kernel configuration — один файл для кастомизации сборки
+# RustyCore kernel configuration — один файл для кастомизации сборки.
+# Честность прежде всего: каждая секция помечена, КТО её реально читает.
 
 [arch]
 target = "x86_64-unknown-none"
-machine = "q35"
+# Rust codegen baseline (-C target-cpu в .cargo/config.toml). Это НЕ модель
+# для QEMU-флага -cpu: такой модели у QEMU нет (проверено:
+# "unable to find CPU model 'x86-64-v2'"), поэтому xtask грузится с
+# `-cpu max` — это надмножество v2 (POPCNT/SSE4.2 включены).
 cpu = "x86-64-v2" # v2 = совместимость везде; v3 = максимум перфа (AVX2)
 
 [sched]
@@ -10,10 +14,12 @@ default = "rr" # rr | cfs
 quantum_us = 1000
 
 [memory]
+# Читает kernel/build.rs (экспорт в KERNEL_CONFIG_* env) + сверка с фичами.
 phys_offset = "0xFFFF800000000000"
 heap_size_kb = 1024
 stack_size = "128K"
-# bump = implemented; buddy = NOT YET (kernel refuses to build with it)
+# bump = implemented; buddy = NOT YET (kernel refuses to build with it).
+# Значение обязано совпадать с Cargo-фичой, иначе сборка падает с объяснением.
 frame_allocator = "bump" # bump | buddy (planned)
 
 [drivers]
@@ -24,9 +30,12 @@ ps2kbd = false
 [log]
 level = "info" # trace | debug | info | warn | error
 
+# Читает ТОЛЬКО `cargo xtask run-qemu` (единственный потребитель).
 [qemu]
+machine = "q35"
 memory = "512M"
 smp = 2
 display = "none"
+# Информационно: -nographic уже вешает COM1 на stdio, отдельный -serial не нужен.
 serial = "stdio"
 extra_args = "-no-reboot -no-shutdown"

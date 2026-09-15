@@ -2,10 +2,12 @@
 name = "rustycore-kernel"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [features]
 # NOTE: default is alloc-bump — alloc-buddy doesn't exist yet and the
 # kernel fails the build loudly if it is selected (see memory::init).
+# sched-*/drv-* are markers for now: no code reads them yet (Phase 3+).
 default = ["arch-x86_64", "sched-rr", "alloc-bump", "drv-uart"]
 arch-x86_64 = []
 sched-rr = []

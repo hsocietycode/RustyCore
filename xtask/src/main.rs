@@ -47,9 +47,41 @@ fn build_image(release: bool) -> Result<PathBuf> {
     Ok(image)
 }
 
+/// Minimal `[qemu]` reader for `config/kernel_config.toml`.
+///
+/// Hand-rolled line parser on purpose — xtask stays dependency-lean:
+/// understands `key = value` under `[qemu]`, strips comments and quotes.
+/// Unknown/missing file → `fallback`, never an error.
+fn qemu_cfg(key: &str, fallback: &str) -> String {
+    let text = std::fs::read_to_string("config/kernel_config.toml").unwrap_or_default();
+    let mut in_qemu = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_qemu = line == "[qemu]";
+            continue;
+        }
+        if !in_qemu {
+            continue;
+        }
+        let line = line.split('#').next().unwrap_or("").trim();
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim() == key {
+                return v.trim().trim_matches('"').to_string();
+            }
+        }
+    }
+    fallback.to_string()
+}
+
 fn run_qemu(release: bool) -> Result<()> {
     let image = build_image(release)?;
     let image = image.to_str().expect("non-utf8 image path");
+    // QEMU flags come from config/kernel_config.toml [qemu] — xtask is the
+    // only consumer, nothing else pretends to own them.
     // NOTE: `-nographic` already wires the first serial port to stdio —
     // passing `-serial stdio` on top makes QEMU abort with
     // "cannot use stdio by multiple character devices".
@@ -57,24 +89,34 @@ fn run_qemu(release: bool) -> Result<()> {
     // NOTE: `-cpu max`, not `qemu64`: the kernel targets x86-64-v2
     // (SSE4.2, POPCNT, ...). The ancient `qemu64` model lacks POPCNT,
     // so core's alignment checks raise #UD → no IDT yet → triple fault.
+    // (`max` is a superset of v2, so the v2 baseline always runs.)
+    let machine = qemu_cfg("machine", "q35");
+    let memory = qemu_cfg("memory", "512M");
+    let smp = qemu_cfg("smp", "2");
+    let display = qemu_cfg("display", "none");
+    let extra: Vec<String> = qemu_cfg("extra_args", "-no-reboot -no-shutdown")
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.args([
         "-machine",
-        "q35",
+        &machine,
         "-cpu",
         "max",
         "-m",
-        "512M",
+        &memory,
         "-smp",
-        "2",
+        &smp,
         "-nographic",
         "-display",
-        "none",
+        &display,
         "-drive",
         &format!("format=raw,file={image}"),
-        "-no-reboot",
-        "-no-shutdown",
     ]);
+    for a in &extra {
+        cmd.arg(a);
+    }
     println!("> {:?}", cmd);
     let status = cmd.status().expect("failed to launch qemu-system-x86_64");
     println!("QEMU exited with {status}");

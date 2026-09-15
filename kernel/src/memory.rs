@@ -87,7 +87,8 @@ pub fn init(boot_info: &'static mut BootInfo) {
 }
 
 /// Sum usable RAM with saturating math — garbage firmware tables must not
-/// wrap the counter around to zero.
+/// wrap the counter around to zero. Inverted regions (`end < start`) are
+/// malformed: skipped loudly, not counted, not added.
 fn usable_summary(regions: &[bootloader_api::info::MemoryRegion]) -> (u64, usize) {
     let mut bytes: u64 = 0;
     let mut count = 0;
@@ -95,7 +96,15 @@ fn usable_summary(regions: &[bootloader_api::info::MemoryRegion]) -> (u64, usize
         .iter()
         .filter(|r| r.kind == MemoryRegionKind::Usable)
     {
-        bytes = bytes.saturating_add(r.end.saturating_sub(r.start));
+        if r.end < r.start {
+            crate::serial_println!(
+                "memory: skipping malformed region [{:#x}..{:#x})",
+                r.start,
+                r.end
+            );
+            continue;
+        }
+        bytes = bytes.saturating_add(r.end - r.start);
         count += 1;
     }
     (bytes, count)

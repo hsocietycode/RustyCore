@@ -9,7 +9,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly
+          # Pinned: an OS kernel must build identically in six months.
+          toolchain: nightly-2026-09-14
           components: rustfmt, clippy, rust-src, llvm-tools-preview
           targets: x86_64-unknown-none
       - run: cargo fmt --all -- --check
@@ -23,3 +24,12 @@ jobs:
         run: cargo check -p rustycore-kernel --target x86_64-unknown-none --release
       - name: BIOS image builds
         run: cargo xtask image
+      - name: QEMU boot smoke test
+        # The kernel halts in an hlt-loop, so QEMU never exits on its own —
+        # `timeout` kills it, and the serial log is the gate: no
+        # "Phase 2 online" line means the boot regressed, fail the job.
+        # (No KVM on Actions runners; TCG emulation is slower but works.)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq qemu-system-x86
+          timeout 150 cargo xtask run-qemu > boot.log 2>&1 || true
+          grep -a "Phase 2 online" boot.log

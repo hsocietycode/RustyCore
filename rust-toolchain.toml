@@ -1,5 +1,7 @@
 [toolchain]
-channel = "nightly"
+# Pinned nightly: unpinned `nightly` drifts and can break bootloader_api
+# builds or lints half a year later. Bump deliberately, verify boot, commit.
+channel = "nightly-2026-09-14"
 profile = "minimal"
 components = ["rust-src", "llvm-tools-preview", "rustfmt", "clippy"]
 targets = ["x86_64-unknown-none"]
