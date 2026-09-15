@@ -16,7 +16,10 @@ const TARGET_HZ: u32 = 100;
 
 /// Program channel 0 for a ~100 Hz square wave and unmask IRQ0 on the PIC.
 pub fn init() {
-    let divisor = (PIT_HZ / TARGET_HZ) as u16;
+    // `try_from`, not `as`: a future TARGET_HZ change (say 10 Hz → 119318)
+    // must fail loudly at boot, never silently truncate the divisor and
+    // boot a kernel whose clock lies about time.
+    let divisor = u16::try_from(PIT_HZ / TARGET_HZ).expect("PIT divisor fits in u16");
     unsafe {
         // Channel 0, lobyte/hibyte, mode 3 (square wave), binary.
         Port::<u8>::new(PIT_CMD).write(0x36);

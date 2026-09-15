@@ -239,9 +239,12 @@ pub fn calibrate() -> Result<u64, &'static str> {
         core::ptr::write_volatile(reg(ICR_OFFSET)?, 0xFFFF_FFFF);
 
         let start = crate::idt::TIMER_TICKS.load(Ordering::Relaxed);
-        // ~100 ms of PIT, then a spin-out guard: 100M busy iterations is
-        // seconds of wall time — if the PIT is dead we say so instead of
-        // hanging. Busy `spin_loop` ON PURPOSE here, not `hlt`: with a
+        // ~100 ms of PIT, then a spin-out guard: 10M busy iterations is
+        // ~a second of wall time on QEMU TCG — if the PIT is dead we say so
+        // instead of hanging. (Was 100M: minutes of wall time on weak CI
+        // before the error surfaced. The PIT path exits in microseconds
+        // when healthy, so a tight guard costs nothing on the happy path.)
+        // Busy `spin_loop` ON PURPOSE here, not `hlt`: with a
         // dead PIT no IRQ ever arrives, so `hlt` would sleep forever and
         // the guard below would never run. Burning ~100 ms of CPU once
         // per boot is the price of a guard that actually guards.
@@ -255,7 +258,7 @@ pub fn calibrate() -> Result<u64, &'static str> {
                 break;
             }
             spins += 1;
-            if spins > 100_000_000 {
+            if spins > 10_000_000 {
                 return Err("apic: PIT produced no ticks during calibration — timer dead?");
             }
             core::hint::spin_loop();
@@ -315,18 +318,21 @@ pub fn start_periodic() -> Result<u64, &'static str> {
 /// End-of-interrupt to the local APIC: write 0 to the EOI register.
 ///
 /// Uses the cached [`MMIO_WINDOW`](crate::memory::MMIO_WINDOW) address from
-/// [`init`] — no MSR read, no arithmetic in the hot path. A zero cache
-/// (called before Step 3 mapped the window) panics loudly instead of
-/// writing to address 0xB0.
+/// [`init`] — no MSR read, no arithmetic in the hot path.
+///
+/// Returns `Err` (instead of panicking) when the window is not mapped yet —
+/// the IDT (with the LAPIC handlers) loads before [`init`] maps the window,
+/// so a stray 0xEF in that gap must degrade to a loud log in the handler,
+/// not a panic inside an interrupt (which would double-panic the kernel).
 ///
 /// # Safety
 /// Caller must be the LAPIC timer/error handler (or Step-5 bring-up):
 /// writing EOI with no interrupt in service is harmless, but writing to a
 /// wrong address is not. Only call after [`init`] succeeded.
-pub fn eoi() {
+pub fn eoi() -> Result<(), &'static str> {
     let win = LAPIC_VIRT.load(core::sync::atomic::Ordering::Relaxed);
     if win == 0 {
-        panic!("apic: eoi before init — LAPIC window not mapped");
+        return Err("apic: eoi before init — LAPIC window not mapped");
     }
     // SAFETY: EOI is write-only-0 by spec; the address goes through
     // `lapic_reg` (checked — the last unchecked `+` in the APIC path).
@@ -335,4 +341,5 @@ pub fn eoi() {
     unsafe {
         core::ptr::write_volatile(eoi, 0);
     }
+    Ok(())
 }

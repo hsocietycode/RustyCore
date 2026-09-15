@@ -94,7 +94,10 @@ pub fn init(boot_info: &'static mut BootInfo) -> (OffsetPageTable<'static>, Boot
         phys_offset.as_u64(),
     );
 
-    self_test(boot_info.memory_regions.len() as u64);
+    self_test(
+        boot_info.memory_regions.len() as u64,
+        env!("KERNEL_CONFIG_MEMORY_SELF_TEST") == "true",
+    );
 
     (mapper, frame_allocator)
 }
@@ -124,8 +127,13 @@ fn usable_summary(regions: &[bootloader_api::info::MemoryRegion]) -> (u64, usize
 }
 
 /// Heap self-test: Box + Vec prove allocation, growth, and values work.
-/// Runs at every boot — a broken heap must scream, never limp along.
-fn self_test(region_count: u64) {
+/// Gated by `[memory] self_test` in the config — `true` screams on a broken
+/// heap at every boot, `false` skips it for speed (heap still initializes).
+fn self_test(region_count: u64, enabled: bool) {
+    if !enabled {
+        crate::serial_println!("memory: heap self-test skipped by config");
+        return;
+    }
     let b = alloc::boxed::Box::new(0xC0F_FEEu64);
     let mut v = alloc::vec::Vec::new();
     v.push(*b);

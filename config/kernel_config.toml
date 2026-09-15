@@ -21,6 +21,9 @@ stack_size = "128K"
 # bump = implemented; buddy = NOT YET (kernel refuses to build with it).
 # Значение обязано совпадать с Cargo-фичой, иначе сборка падает с объяснением.
 frame_allocator = "bump" # bump | buddy (planned)
+# Heap self-test (Box+Vec) при каждом буте. true = ловить битую кучу сразу,
+# false = пропустить ради скорости (heap всё равно инициализируется).
+self_test = true
 
 [drivers]
 uart = true

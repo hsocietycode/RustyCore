@@ -101,6 +101,9 @@ extern "x86-interrupt" fn divide_error_handler(stack_frame: InterruptStackFrame)
 
 extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
     use core::sync::atomic::Ordering;
+    // Relaxed is honest here: single-CPU kernel (APs not started yet), the
+    // counter is write-only from this handler, read-only from main. When SMP
+    // lands, revisit — cross-CPU tick reads will want Acquire.
     TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
     unsafe {
         crate::interrupts::PICS
@@ -136,17 +139,22 @@ extern "x86-interrupt" fn syscall_stub_handler(_stack_frame: InterruptStackFrame
 ///
 /// Cannot fire before Step 5 by hardware contract: LVT entries reset masked
 /// and SVR resets disabled, so no local-APIC source can raise until bring-up
-/// unmasks them. A stray fire earlier would #PF inside `eoi()` (window not
-/// yet mapped) — loud, with the faulting address, by our page-fault handler.
+/// unmasks them. If one ever does slip through early (stray 0xEF in the gap
+/// between `idt::init` and `apic::init`), the `Err` path logs loudly instead
+/// of panicking inside the interrupt — a panic here would double-panic.
 extern "x86-interrupt" fn apic_timer_handler(_stack_frame: InterruptStackFrame) {
     use core::sync::atomic::Ordering;
     APIC_TICKS.fetch_add(1, Ordering::Relaxed);
-    crate::apic::eoi();
+    if let Err(e) = crate::apic::eoi() {
+        crate::serial_println!("apic-timer: stray fire ({}), ignored", e);
+    }
 }
 
 /// LAPIC error (ESR). Loud by design: print and continue — a masked error
 /// vector that nobody reads is how silent interrupt loss starts.
 extern "x86-interrupt" fn apic_error_handler(_stack_frame: InterruptStackFrame) {
     crate::serial_println!("apic: error interrupt (ESR unread in this step)");
-    crate::apic::eoi();
+    if let Err(e) = crate::apic::eoi() {
+        crate::serial_println!("apic-error: stray fire ({}), ignored", e);
+    }
 }
