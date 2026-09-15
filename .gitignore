@@ -1,13 +1,18 @@
+# Build output
 /target/
 **/target/
+
+# Backups / editor noise
 *.rs.bk
-Cargo.lock
-# keep xtask lock for reproducibility? uncomment to keep:
-# !xtask/Cargo.lock
+*.swp
+.vscode/
+.idea/
+.DS_Store
+
+# QEMU / image artifacts
 qemu.log
 *.img
 *.iso
-.vscode/
-.idea/
-*.swp
-.DS_Store
+
+# NOTE: Cargo.lock is intentionally NOT ignored — this is an OS,
+# reproducible builds matter. Keep the lockfile committed.

@@ -16,11 +16,13 @@ opt-speed = []
 opt-size = []
 
 [dependencies]
-bootloader = "0.9"
-x86_64 = "0.14"
-uart_16550 = "0.3"
-spin = "0.9"
+# Split of bootloader 0.11, done right:
+# - kernel (this crate, bare-metal) links ONLY bootloader_api:
+#   pure no_std, just the entry_point! macro + BootInfo types.
+# - the host-side image builder (bootloader crate with std, BIOS/UEFI
+#   disk image assembly) moves to xtask, which builds for the HOST
+#   triple with full std. See xtask/Cargo.toml.
+bootloader_api = "0.11"
+x86_64 = "0.15"
+spin = "0.10"
 pic8259 = "0.11"
-
-[build-dependencies]
-toml = "0.8"

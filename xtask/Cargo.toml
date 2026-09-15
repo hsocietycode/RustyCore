@@ -9,5 +9,8 @@ name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
+# Host-side image builder (full std). BIOS-only: the 0.11 UEFI helper
+# needs a COFF link (wcslen) this host's rust-lld can't satisfy.
+# UEFI images come back in Phase 1 with a proper OVMF setup.
+bootloader = { version = "0.11", default-features = false, features = ["bios"] }
 anyhow = "1.0"
-clap = { version = "4.5", features = ["derive"] }

@@ -1,14 +1,33 @@
-use std::process::Command;
+use anyhow::{Context, Result};
+use std::{path::PathBuf, process::Command};
+
+const TARGET: &str = "x86_64-unknown-none";
 
 fn usage() -> ! {
-    eprintln!("usage: cargo xtask <build|run-qemu> [--release]");
+    eprintln!("usage: cargo xtask <build|image|run-qemu> [--release]");
     std::process::exit(1);
+}
+
+fn kernel_elf_path(release: bool) -> PathBuf {
+    let profile = if release { "release" } else { "debug" };
+    PathBuf::from("target")
+        .join(TARGET)
+        .join(profile)
+        .join("rustycore-kernel")
+}
+
+fn image_path(release: bool) -> PathBuf {
+    let profile = if release { "release" } else { "debug" };
+    PathBuf::from("target")
+        .join(TARGET)
+        .join(profile)
+        .join("rustycore-bios.img")
 }
 
 fn build_kernel(release: bool) {
     let mut cmd = Command::new("cargo");
     cmd.arg("build").arg("-p").arg("rustycore-kernel");
-    cmd.arg("--target").arg("x86_64-unknown-none");
+    cmd.arg("--target").arg(TARGET);
     if release {
         cmd.arg("--release");
     }
@@ -17,36 +36,64 @@ fn build_kernel(release: bool) {
     assert!(status.success(), "kernel build failed");
 }
 
-fn run_qemu(release: bool) {
+fn build_image(release: bool) -> Result<PathBuf> {
     build_kernel(release);
-    let kernel_bin = if release {
-        "target/x86_64-unknown-none/release/rustycore-kernel"
-    } else {
-        "target/x86_64-unknown-none/debug/rustycore-kernel"
-    };
+    let kernel = kernel_elf_path(release);
+    let image = image_path(release);
+    bootloader::DiskImageBuilder::new(kernel)
+        .create_bios_image(&image)
+        .context("failed to build BIOS disk image")?;
+    println!("image: {}", image.display());
+    Ok(image)
+}
+
+fn run_qemu(release: bool) -> Result<()> {
+    let image = build_image(release)?;
+    let image = image.to_str().expect("non-utf8 image path");
+    // NOTE: `-nographic` already wires the first serial port to stdio —
+    // passing `-serial stdio` on top makes QEMU abort with
+    // "cannot use stdio by multiple character devices".
+    //
+    // NOTE: `-cpu max`, not `qemu64`: the kernel targets x86-64-v2
+    // (SSE4.2, POPCNT, ...). The ancient `qemu64` model lacks POPCNT,
+    // so core's alignment checks raise #UD → no IDT yet → triple fault.
     let mut cmd = Command::new("qemu-system-x86_64");
     cmd.args([
-        "-machine", "q35",
-        "-cpu", "qemu64",
-        "-m", "512M",
-        "-smp", "2",
+        "-machine",
+        "q35",
+        "-cpu",
+        "max",
+        "-m",
+        "512M",
+        "-smp",
+        "2",
         "-nographic",
-        "-serial", "stdio",
-        "-display", "none",
-        "-kernel", kernel_bin,
-        "-no-reboot", "-no-shutdown",
+        "-display",
+        "none",
+        "-drive",
+        &format!("format=raw,file={image}"),
+        "-no-reboot",
+        "-no-shutdown",
     ]);
     println!("> {:?}", cmd);
     let status = cmd.status().expect("failed to launch qemu-system-x86_64");
     println!("QEMU exited with {status}");
+    Ok(())
 }
 
-fn main() {
+fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let sub = args.next().unwrap_or_else(|| usage());
-    let release = std::env::args().any(|a| a == "--release");
+    let release = args.any(|a| a == "--release");
     match sub.as_str() {
-        "build" => build_kernel(release),
+        "build" => {
+            build_kernel(release);
+            Ok(())
+        }
+        "image" => {
+            build_image(release)?;
+            Ok(())
+        }
         "run-qemu" => run_qemu(release),
         _ => usage(),
     }

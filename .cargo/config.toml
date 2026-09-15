@@ -1,8 +1,16 @@
-[build]
-target = "x86_64-unknown-none"
+# NOTE: no global [build] target on purpose — xtask is a HOST tool and must
+# build for the default host triple. The kernel target is passed explicitly
+# by `cargo xtask build` (`--target x86_64-unknown-none`).
+[alias]
+xtask = "run -p xtask --"
 
 [target.x86_64-unknown-none]
+# rust-lld ships with the toolchain (llvm-tools-preview) — lets us link
+# the kernel without a system C toolchain (no cc/gcc needed).
+linker = "rust-lld"
 rustflags = ["-C", "target-cpu=x86-64-v2", "-C", "force-frame-pointers=no"]
 
 [unstable]
-build-std = ["core", "compiler_builtins"]
+# bootloader_api is pure no_std (core only), so plain prebuilt core is
+# enough for the kernel target — no build-std needed anymore.
+# (The std-heavy `bootloader` image builder lives in xtask = host triple.)

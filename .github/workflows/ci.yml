@@ -1,5 +1,7 @@
 name: ci
+
 on: [push, pull_request]
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -8,8 +10,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
-          components: rustfmt, clippy, rust-src
+          components: rustfmt, clippy, rust-src, llvm-tools-preview
           targets: x86_64-unknown-none
       - run: cargo fmt --all -- --check
-      - run: cargo clippy -p xtask --all-targets -- -D warnings
-      - run: cargo test -p xtask || true
+      - name: xtask (host)
+        run: cargo clippy -p xtask --all-targets -- -D warnings
+      - name: kernel debug
+        run: cargo check -p rustycore-kernel --target x86_64-unknown-none
+      - name: kernel release (opt3, LTO fat)
+        run: cargo check -p rustycore-kernel --target x86_64-unknown-none --release
+      - name: BIOS image builds
+        run: cargo xtask image

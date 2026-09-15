@@ -9,7 +9,6 @@ fn main() {
         .join("config/kernel_config.toml");
 
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=linker.ld");
     println!("cargo:rerun-if-changed={}", config_path.display());
 
     let config = fs::read_to_string(&config_path).unwrap_or_default();
@@ -25,6 +24,4 @@ fn main() {
             println!("cargo:rustc-env=KERNEL_CONFIG_{}={}", k.to_uppercase(), v);
         }
     }
-
-    println!("cargo:rustc-link-search={}", manifest_dir.display());
 }
