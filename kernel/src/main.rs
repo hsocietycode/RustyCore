@@ -54,7 +54,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         "no local APIC (CPUID bit 9 clear) — cannot continue"
     );
 
-    memory::init(boot_info);
+    let (mut mapper, mut frame_allocator) = memory::init(boot_info);
+
+    // Step 3: map the LAPIC MMIO page + enable the local APIC (volatile
+    // SVR/LVT/TPR). PIC+PIT stays the one true clock — LVT timer masked.
+    // Boot must fail loudly here: a half-mapped APIC is worse than none.
+    apic::init(&mut mapper, &mut frame_allocator, &apic).expect("apic init failed");
 
     timer::init();
 

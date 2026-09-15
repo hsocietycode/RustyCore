@@ -6,10 +6,19 @@
 //! is enabled — the PIC+PIT path stays the one true clock.
 
 use bootloader_api::BootInfo;
-use x86_64::registers::model_specific::Msr;
+use x86_64::{
+    registers::model_specific::Msr,
+    structures::paging::{FrameAllocator, OffsetPageTable, Size4KiB},
+};
 
 /// IA32_APIC_BASE MSR index.
 const IA32_APIC_BASE: u32 = 0x1B;
+
+/// Base-address mask: bits 12..=51 (physical base, 4KiB-aligned).
+/// Bits 0..=7 are flags (BSP, x2APIC, global enable), 8..=11 reserved.
+/// The old mask 0xFFFF_F000_0000 ate bits 12..=27 — on our q35 it turned
+/// the real 0xFEE00000 into 0xF0000000. Caught by adversarial review.
+const APIC_BASE_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
 /// QEMU q35 well-known fallback base when no MADT is consulted yet.
 pub const FALLBACK_BASE: u64 = 0xFEE0_0000;
@@ -48,7 +57,7 @@ pub fn probe(boot_info: &BootInfo) -> Probe {
 
     // SAFETY: reading IA32_APIC_BASE changes nothing.
     let msr = unsafe { Msr::new(IA32_APIC_BASE).read() };
-    let base = msr & 0xFFFF_F000_0000;
+    let base = msr & APIC_BASE_MASK;
     let enabled = msr & (1 << 11) != 0;
     let bsp = msr & (1 << 8) != 0;
 
@@ -81,35 +90,98 @@ pub fn probe(boot_info: &BootInfo) -> Probe {
     }
 }
 
+/// LAPIC register offsets from the MMIO base.
+const ID_OFFSET: u64 = 0x20;
+const VER_OFFSET: u64 = 0x30;
+const TPR_OFFSET: u64 = 0x80;
+const SVR_OFFSET: u64 = 0xF0;
+const LVT_TIMER_OFFSET: u64 = 0x320;
+
+/// Map + enable the local APIC (Step 3).
+///
+/// Maps the LAPIC MMIO page into the dedicated [`crate::memory::MMIO_WINDOW`]
+/// (device flags, NO_CACHE — see `map_mmio_window` for why not phys-offset),
+/// caches the window address for `eoi()`, then via volatile MMIO: enables
+/// via SVR (`0xF0 = 0x1FF`: spurious vector `0xFF` + enable bit 8), masks
+/// the LVT timer (`0x320 |= 1 << 16` — PIC stays the one true clock),
+/// zeroes TPR (`0x80 = 0`), and reports ID/VER/SVR.
+///
+/// # Errors
+/// `Err` (never panics) when `probe.present` is false, the APIC is
+/// soft-disabled in the MSR (bit 11 clear), the base is unaligned, the
+/// window is occupied, or any address computation overflows.
+pub fn init(
+    mapper: &mut OffsetPageTable,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    probe: &Probe,
+) -> Result<(), &'static str> {
+    if !probe.present {
+        return Err("no local APIC present (CPUID bit 9 clear)");
+    }
+    if !probe.enabled {
+        return Err("APIC soft-disabled (IA32_APIC_BASE bit 11 clear) — refusing to pretend");
+    }
+    let base = crate::memory::map_mmio_window(mapper, frame_allocator, probe.base)?;
+    LAPIC_VIRT.store(base.as_u64(), core::sync::atomic::Ordering::Relaxed);
+
+    // SAFETY: `base` is the mapped LAPIC window (one MMIO page); offsets
+    // are architecturally fixed u32 registers. Volatile: the compiler must
+    // emit every read/write exactly once, in order. Checked arithmetic:
+    // a garbage probe base must Err here, never wrap into чужую memory.
+    let reg = |off: u64| -> Result<*mut u32, &'static str> {
+        base.as_u64()
+            .checked_add(off)
+            .map(|a| a as *mut u32)
+            .ok_or("apic register address overflows")
+    };
+    unsafe {
+        let svr = reg(SVR_OFFSET)?;
+        core::ptr::write_volatile(svr, 0x1FF);
+
+        let lvt_timer = reg(LVT_TIMER_OFFSET)?;
+        let lvt = core::ptr::read_volatile(lvt_timer);
+        core::ptr::write_volatile(lvt_timer, lvt | (1 << 16));
+
+        let tpr = reg(TPR_OFFSET)?;
+        core::ptr::write_volatile(tpr, 0);
+
+        let id = core::ptr::read_volatile(reg(ID_OFFSET)? as *const u32) >> 24;
+        let ver = core::ptr::read_volatile(reg(VER_OFFSET)? as *const u32);
+        let svr_val = core::ptr::read_volatile(svr as *const u32);
+        crate::serial_println!(
+            "apic: mapped + enabled id={} ver={:#x} svr={:#x}",
+            id,
+            ver,
+            svr_val
+        );
+    }
+    Ok(())
+}
+
+/// Cached LAPIC window address, stored by [`init`]. `0` = not mapped yet.
+/// `eoi()` reads this instead of re-reading the MSR on every timer tick —
+/// cheaper, and immune to MSR-vs-mapping drift.
+static LAPIC_VIRT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// End-of-interrupt to the local APIC: write 0 to the EOI register.
 ///
-/// The MMIO base comes from the Step-1 probe (MSR truth, not a hardcoded
-/// constant). The LAPIC window is MMIO, NOT RAM — the phys-offset mapping
-/// does not cover it until Step 3 explicitly maps the page. Calling this
-/// before Step 3 #PFs (loud, with the faulting address); by hardware reset
-/// contract (LVT masked, SVR disabled) no handler can reach it that early.
+/// Uses the cached [`MMIO_WINDOW`](crate::memory::MMIO_WINDOW) address from
+/// [`init`] — no MSR read, no arithmetic in the hot path. A zero cache
+/// (called before Step 3 mapped the window) panics loudly instead of
+/// writing to address 0xB0.
 ///
 /// # Safety
 /// Caller must be the LAPIC timer/error handler (or Step-5 bring-up):
 /// writing EOI with no interrupt in service is harmless, but writing to a
-/// wrong address is not. Only call after `probe()` confirmed presence AND
-/// Step 3 mapped the window.
+/// wrong address is not. Only call after [`init`] succeeded.
 pub fn eoi() {
-    use x86_64::registers::model_specific::Msr;
-    // SAFETY: read-only MSR query (see probe).
-    let msr = unsafe { Msr::new(IA32_APIC_BASE).read() };
-    let base = msr & 0xFFFF_F000_0000;
-    let base = if base == 0 { FALLBACK_BASE } else { base };
-    // Checked arithmetic on purpose: a garbage MSR base must panic here
-    // with the address in the message, never wrap (release) into a write
-    // to somebody else's memory from inside an interrupt handler.
-    let addr = crate::memory::PHYS_MEM_OFFSET
-        .checked_add(base)
-        .and_then(|a| a.checked_add(EOI_OFFSET))
-        .unwrap_or_else(|| panic!("apic: EOI address overflow (base={base:#x})"));
-    // SAFETY: EOI is write-only-0 by spec; the address is the probed
-    // LAPIC base + 0xB0, mapped by Step 3 (see doc above).
+    let win = LAPIC_VIRT.load(core::sync::atomic::Ordering::Relaxed);
+    if win == 0 {
+        panic!("apic: eoi before init — LAPIC window not mapped");
+    }
+    // SAFETY: EOI is write-only-0 by spec; the address is the mapped
+    // MMIO window + 0xB0 (offsets < 4KiB, cannot overflow the page).
     unsafe {
-        core::ptr::write_volatile(addr as *mut u32, 0);
+        core::ptr::write_volatile((win + EOI_OFFSET) as *mut u32, 0);
     }
 }

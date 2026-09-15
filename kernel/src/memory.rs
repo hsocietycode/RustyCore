@@ -16,7 +16,7 @@ pub use bump::BootFrameAllocator;
 use bootloader_api::{info::MemoryRegionKind, BootInfo};
 use x86_64::{
     structures::paging::{
-        FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PhysFrame, Size4KiB,
+        FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PhysFrame, Size4KiB, Translate,
     },
     VirtAddr,
 };
@@ -29,6 +29,14 @@ pub const PHYS_MEM_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 /// `config/kernel_config.toml` by build.rs — a stale literal here would be a lie).
 pub const HEAP_START: u64 = 0xFFFF_9000_0000_0000;
 pub const HEAP_SIZE: usize = parse_heap_bytes();
+
+/// Dedicated virtual window for one MMIO page (today: the LAPIC).
+/// Deliberately OUTSIDE the bootloader's phys-offset mapping: that window
+/// uses huge pages with RAM flags, and a 4KiB flag-upgrade inside a huge
+/// page is impossible by hardware design. Our own window maps exactly one
+/// 4KiB page with device-correct flags — no aliasing, no flag surgery on
+/// somebody else's tables.
+pub const MMIO_WINDOW: u64 = 0xFFFF_A000_0000_0000;
 
 /// `const` decimal parser for the build-time heap-size-bytes env string.
 const fn parse_heap_bytes() -> usize {
@@ -45,7 +53,10 @@ const fn parse_heap_bytes() -> usize {
 }
 
 /// Initialize frame allocator + heap, print a memory summary.
-pub fn init(boot_info: &'static mut BootInfo) {
+///
+/// Returns the page-table mapper and frame allocator so later boot steps
+/// (APIC MMIO mapping) can reuse them without rebuilding from raw tables.
+pub fn init(boot_info: &'static mut BootInfo) -> (OffsetPageTable<'static>, BootFrameAllocator) {
     // Honesty gate, enforced at COMPILE time: `alloc-buddy` isn't
     // implemented yet — selecting it (or nothing, or both) refuses to
     // build instead of silently booting the wrong allocator.
@@ -84,6 +95,8 @@ pub fn init(boot_info: &'static mut BootInfo) {
     );
 
     self_test(boot_info.memory_regions.len() as u64);
+
+    (mapper, frame_allocator)
 }
 
 /// Sum usable RAM with saturating math — garbage firmware tables must not
@@ -136,6 +149,56 @@ unsafe fn mapper(phys_offset: VirtAddr) -> OffsetPageTable<'static> {
     let virt = phys_offset + phys.as_u64();
     let table: *mut PageTable = virt.as_mut_ptr();
     unsafe { OffsetPageTable::new(&mut *table, phys_offset) }
+}
+
+/// Map ONE 4KiB MMIO page into the dedicated [`MMIO_WINDOW`]:
+/// phys frame -> `MMIO_WINDOW`, with device-correct flags
+/// `PRESENT | WRITABLE | NO_CACHE | NO_EXECUTE`.
+///
+/// Why a separate window instead of reusing the phys-offset address?
+/// The bootloader maps phys space with huge pages + RAM flags, and x86
+/// cannot change flags on a 4KiB sub-page of a huge page. A private
+/// window maps exactly one small page — no flag surgery, no aliasing.
+/// Single-window today (one LAPIC); a bump allocator over windows comes
+/// with the IOAPIC step if more MMIO appears.
+///
+/// # Errors
+/// `Err` when `phys` is unaligned, the window is already occupied, or
+/// frames run out mid-map (fresh page-table levels).
+pub fn map_mmio_window(
+    mapper: &mut OffsetPageTable,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    phys: u64,
+) -> Result<VirtAddr, &'static str> {
+    use x86_64::{
+        structures::paging::{PageTableFlags, PhysFrame},
+        PhysAddr,
+    };
+    if !phys.is_multiple_of(4096) {
+        return Err("mmio phys address is not 4KiB-aligned");
+    }
+    let virt = VirtAddr::new(MMIO_WINDOW);
+    let flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::NO_CACHE
+        | PageTableFlags::NO_EXECUTE;
+    let page = Page::<Size4KiB>::containing_address(virt);
+    if mapper.translate_addr(virt).is_some() {
+        return Err("mmio window already occupied — single-window kernel, one MMIO page max");
+    }
+    let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(phys));
+    unsafe {
+        mapper
+            .map_to(page, frame, flags, frame_allocator)
+            .map_err(|_| "mmio window map failed (frames out?)")?
+            .flush();
+    }
+    crate::serial_println!(
+        "memory: mmio window {:#x} -> phys {:#x} (NO_CACHE|NO_EXECUTE)",
+        virt.as_u64(),
+        phys
+    );
+    Ok(virt)
 }
 
 /// Allocate frames backing `[start, start + size)` and map them.
