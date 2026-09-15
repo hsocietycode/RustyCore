@@ -2,7 +2,9 @@
 //!
 //! Vectors 0..=31 are CPU exceptions (breakpoint, double fault, page fault,
 //! ...). Vectors 32..=47 are the remapped 8259 PIC (timer on 32, keyboard
-//! on 33). Anything else that fires lands in the GP handler and halts —
+//! on 33). High vectors are APIC sidecars (Step 2 registers them, Step 5
+//! fires them): 0x80 syscall stub, 0xEF LAPIC timer, 0xFE LAPIC error.
+//! Anything else that fires lands in the GP handler and halts —
 //! loud failure beats silent corruption.
 
 use crate::gdt;
@@ -13,8 +15,19 @@ use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, Pag
 pub const TIMER_VECTOR: u8 = 32;
 pub const KEYBOARD_VECTOR: u8 = 33;
 
+/// APIC sidecar vectors (high range — clear of CPU exceptions and the PIC).
+pub const SYSCALL_VECTOR: u8 = 0x80;
+pub const LAPIC_TIMER_VECTOR: u8 = 0xEF;
+pub const LAPIC_ERROR_VECTOR: u8 = 0xFE;
+
 /// Timer ticks since `timer::init`. Written by the IRQ handler, read by main.
 pub static TIMER_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// LAPIC timer ticks since Step 5. Same counter discipline as TIMER_TICKS.
+pub static APIC_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// `int 0x80` hits since boot. Kernel-only stub for now (Ring0, no STAR/LSTAR).
+pub static SYSCALL_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 lazy_static! {
     static ref IDT: InterruptDescriptorTable = {
@@ -33,6 +46,11 @@ lazy_static! {
         idt.divide_error.set_handler_fn(divide_error_handler);
         idt[TIMER_VECTOR].set_handler_fn(timer_handler);
         idt[KEYBOARD_VECTOR].set_handler_fn(keyboard_handler);
+        // APIC sidecars (Step 2): registered but silent until Step 5 maps
+        // and enables the LAPIC. DPL stays Ring0 — no userspace yet.
+        idt[SYSCALL_VECTOR].set_handler_fn(syscall_stub_handler);
+        idt[LAPIC_TIMER_VECTOR].set_handler_fn(apic_timer_handler);
+        idt[LAPIC_ERROR_VECTOR].set_handler_fn(apic_error_handler);
         idt
     };
 }
@@ -102,4 +120,33 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
             .lock()
             .notify_end_of_interrupt(KEYBOARD_VECTOR);
     }
+}
+
+/// Kernel-only syscall stub (`int 0x80`). Counts hits; real dispatch with
+/// STAR/LSTAR + ring-3 entry lands in a later step. EOI is a PIC no-op by
+/// design: vector 0x80 is software-raised, the PIC never sees it.
+extern "x86-interrupt" fn syscall_stub_handler(_stack_frame: InterruptStackFrame) {
+    use core::sync::atomic::Ordering;
+    let n = SYSCALL_HITS.fetch_add(1, Ordering::Relaxed) + 1;
+    crate::serial_println!("syscall: stub hit count={}", n);
+}
+
+/// LAPIC timer ( Step 5 fires this). Counts ticks, then EOI straight to the
+/// local APIC — the 8259 never sees LAPIC vectors, so no PIC ack here.
+///
+/// Cannot fire before Step 5 by hardware contract: LVT entries reset masked
+/// and SVR resets disabled, so no local-APIC source can raise until bring-up
+/// unmasks them. A stray fire earlier would #PF inside `eoi()` (window not
+/// yet mapped) — loud, with the faulting address, by our page-fault handler.
+extern "x86-interrupt" fn apic_timer_handler(_stack_frame: InterruptStackFrame) {
+    use core::sync::atomic::Ordering;
+    APIC_TICKS.fetch_add(1, Ordering::Relaxed);
+    crate::apic::eoi();
+}
+
+/// LAPIC error (ESR). Loud by design: print and continue — a masked error
+/// vector that nobody reads is how silent interrupt loss starts.
+extern "x86-interrupt" fn apic_error_handler(_stack_frame: InterruptStackFrame) {
+    crate::serial_println!("apic: error interrupt (ESR unread in this step)");
+    crate::apic::eoi();
 }

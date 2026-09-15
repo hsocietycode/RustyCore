@@ -10,6 +10,7 @@ mod idt;
 mod interrupts;
 mod memory;
 mod serial;
+mod syscall;
 mod timer;
 
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
@@ -62,6 +63,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("self-test: firing int3 breakpoint...");
     x86_64::instructions::interrupts::int3();
     serial_println!("self-test: breakpoint handler returned, IDT works.");
+
+    // Self-test #1b: syscall stub (Step 2). `int 0x80` twice, still IF=0 —
+    // software interrupts don't need the flag. Proves the 0x80 gate is live.
+    syscall::self_test();
 
     // Self-test #2: hardware timer. Enable IF, wait for ~100 ticks
     // (~1 second at 100 Hz), all driven by IRQ0 through the PIC.

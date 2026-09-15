@@ -14,6 +14,9 @@ const IA32_APIC_BASE: u32 = 0x1B;
 /// QEMU q35 well-known fallback base when no MADT is consulted yet.
 pub const FALLBACK_BASE: u64 = 0xFEE0_0000;
 
+/// LAPIC EOI register offset from the MMIO base.
+const EOI_OFFSET: u64 = 0xB0;
+
 /// Result of the read-only probe, kept for later steps.
 #[derive(Debug, Clone, Copy)]
 pub struct Probe {
@@ -75,5 +78,30 @@ pub fn probe(boot_info: &BootInfo) -> Probe {
         enabled,
         bsp,
         have_rsdp,
+    }
+}
+
+/// End-of-interrupt to the local APIC: write 0 to the EOI register.
+///
+/// The MMIO base comes from the Step-1 probe (MSR truth, not a hardcoded
+/// constant). Until Step 3 maps it, the phys-offset mapping already covers
+/// it — the bootloader maps all RAM there, and the LAPIC window is
+/// addressable through it on q35.
+///
+/// # Safety
+/// Caller must be the LAPIC timer/error handler (or Step-5 bring-up):
+/// writing EOI with no interrupt in service is harmless, but writing to a
+/// wrong address is not. Only call after `probe()` confirmed presence.
+pub fn eoi() {
+    use x86_64::registers::model_specific::Msr;
+    // SAFETY: read-only MSR query (see probe).
+    let msr = unsafe { Msr::new(IA32_APIC_BASE).read() };
+    let base = msr & 0xFFFF_F000_0000;
+    let base = if base == 0 { FALLBACK_BASE } else { base };
+    // SAFETY: EOI is write-only-0 by spec; the address is the probed
+    // LAPIC base + 0xB0, mapped via the phys-offset window.
+    unsafe {
+        let eoi = (crate::memory::PHYS_MEM_OFFSET + base + EOI_OFFSET) as *mut u32;
+        core::ptr::write_volatile(eoi, 0);
     }
 }
