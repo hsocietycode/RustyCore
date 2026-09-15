@@ -10,7 +10,10 @@ Org: https://github.com/hsocietycode
 Boots in QEMU today:
 
 ```
-RustyCore v0.1 - serial online, PIC remapped, halting.
+RustyCore v0.1 - serial online, PIC remapped.
+memory: 505 MiB usable, heap 1024 KiB at 0xffff900000000000, phys offset 0xffff800000000000
+memory: heap smoke test ok (box=0xc0ffee, vec_len=2)
+RustyCore v0.1 - memory online, halting.
 ```
 
 ## Prereqs

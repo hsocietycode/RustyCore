@@ -10,10 +10,12 @@
 - [x] `-cpu max` in xtask (kernel is x86-64-v2: `qemu64` lacks POPCNT → #UD → triple fault)
 - [x] CI: fmt + xtask clippy + kernel check (debug/release) + image build
 
-## Phase 1 — Memory (v0.2)
-- [ ] 4-level paging, HHDM offset map
-- [ ] Frame allocator: bump → buddy (фича `alloc-buddy`)
-- [ ] Kernel heap (`linked_list_allocator`)
+## Phase 1 — Memory (v0.2) — DONE, boots in QEMU
+- [x] `physical_memory` mapping at `0xFFFF_8000_0000_0000` via BOOTLOADER_CONFIG
+- [x] Frame allocator: bump (`BootFrameAllocator` over Usable regions)
+- [x] Kernel heap 1 MiB (`linked_list_allocator`, Box+Vec smoke test ok)
+- [x] Boot proof: `memory: 505 MiB usable, heap 1024 KiB ... smoke test ok`
+- [ ] Buddy allocator (`alloc-buddy` feature) — next
 - [ ] Host unit-tests
 - [ ] UEFI image path (`bootloader` uefi feature + OVMF in xtask)
 
