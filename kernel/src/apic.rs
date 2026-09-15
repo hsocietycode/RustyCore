@@ -174,13 +174,27 @@ pub fn init(
 static LAPIC_VIRT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Calibrated LAPIC-timer ticks per ~10 ms, stored by [`calibrate`].
-/// `0` = not calibrated yet. Read by Step 5 to program the periodic rate.
+/// `0` = not calibrated yet. Read by Step 5 via [`ticks_per_10ms`].
 static TICKS_PER_10MS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Calibrated ticks per ~10 ms window (`0` = not calibrated yet).
+/// Step 5 programs the periodic rate from this; a zero means
+/// [`calibrate`] failed and the APIC timer stays off.
+#[allow(dead_code)] // consumed by Step 5 (dual-clock soak) — not yet written
+pub fn ticks_per_10ms() -> u64 {
+    TICKS_PER_10MS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// PIT rate (Hz) and ruler length (ticks) used by [`calibrate`].
+/// 10 ticks at 100 Hz ≈ 100 ms ≈ ten 10 ms windows.
+const PIT_HZ: u32 = 100;
+const CALIB_PIT_TICKS: u32 = 10;
 
 /// Pure tick math for [`calibrate`]: APIC ticks elapsed during `pit_ticks`
 /// PIT ticks at `pit_hz`, scaled to a 10 ms window. Saturating + div0-guarded
 /// so garbage inputs yield 0 (Step 5 treats 0 as "calibration failed",
-/// never as a rate). Host-unit-testable: no MMIO, no globals.
+/// never as a rate). Pure function — no MMIO, no globals — so it is
+/// unit-testable whenever the host test harness lands.
 pub fn calibrate_ticks(delta: u32, pit_hz: u32, pit_ticks: u32) -> u64 {
     if pit_hz == 0 || pit_ticks == 0 {
         return 0;
@@ -197,11 +211,13 @@ pub fn calibrate_ticks(delta: u32, pit_hz: u32, pit_ticks: u32) -> u64 {
 /// Calibrate the LAPIC timer against the PIT ruler (Step 4).
 ///
 /// One-shot, no LAPIC IRQs: DCR = divide-by-16, ICR = 0xFFFFFFFF, then
-/// sleep until `TIMER_TICKS` advances 10 PIT ticks (~100 ms at 100 Hz)
-/// and read CCR.
+/// burn ~100 ms of CPU waiting for `TIMER_TICKS` to advance
+/// `CALIB_PIT_TICKS` PIT ticks, and read CCR.
 ///
-/// Requires IF=1 — the PIT ruler advances via IRQ0, and with IF=0 the
-/// wait loop spins forever (no ticks ever arrive). Main enables
+/// Requires IF=1 — the PIT ruler advances via IRQ0, and with IF=0 no ticks
+/// ever arrive. Busy-wait (not `hlt`) deliberately: if the PIT itself is
+/// dead, `hlt` would sleep forever past the spin-out guard below, while a
+/// busy loop trips the guard in seconds and reports it. Main enables
 /// interrupts before calling.
 ///
 /// Stores `ticks_per_10ms`; prints the delta for the log. A zero delta
@@ -224,16 +240,18 @@ pub fn calibrate() -> Result<u64, &'static str> {
         core::ptr::write_volatile(reg(ICR_OFFSET)?, 0xFFFF_FFFF);
 
         let start = crate::idt::TIMER_TICKS.load(Ordering::Relaxed);
-        // ~100 ms of PIT, then a spin-out guard: 100M loop iterations is
-        // minutes of wall time — if the PIT is dead we say so instead of
-        // hanging. `hlt` (not spin_loop): the ruler advances via IRQ0,
-        // which needs IF=1 + a sleeping CPU to be observed promptly.
+        // ~100 ms of PIT, then a spin-out guard: 100M busy iterations is
+        // seconds of wall time — if the PIT is dead we say so instead of
+        // hanging. Busy `spin_loop` ON PURPOSE here, not `hlt`: with a
+        // dead PIT no IRQ ever arrives, so `hlt` would sleep forever and
+        // the guard below would never run. Burning ~100 ms of CPU once
+        // per boot is the price of a guard that actually guards.
         let mut spins: u64 = 0;
         loop {
             if crate::idt::TIMER_TICKS
                 .load(Ordering::Relaxed)
                 .wrapping_sub(start)
-                >= 10
+                >= CALIB_PIT_TICKS as u64
             {
                 break;
             }
@@ -241,7 +259,7 @@ pub fn calibrate() -> Result<u64, &'static str> {
             if spins > 100_000_000 {
                 return Err("apic: PIT produced no ticks during calibration — timer dead?");
             }
-            x86_64::instructions::hlt();
+            core::hint::spin_loop();
         }
 
         let cur = core::ptr::read_volatile(reg(CCR_OFFSET)? as *const u32);
@@ -249,8 +267,7 @@ pub fn calibrate() -> Result<u64, &'static str> {
         if delta == 0 {
             return Err("apic: CCR delta is zero — MMIO writes lost (NO_CACHE missing?)");
         }
-        // PIT is 100 Hz (see timer.rs): 10 ticks ≈ 100 ms ≈ 10 ms × 10.
-        let per_10ms = calibrate_ticks(delta, 100, 10);
+        let per_10ms = calibrate_ticks(delta, PIT_HZ, CALIB_PIT_TICKS);
         TICKS_PER_10MS.store(per_10ms, Ordering::Relaxed);
         crate::serial_println!(
             "apic-timer: calibrate ccr_delta={} (~{} ticks/ms)",
