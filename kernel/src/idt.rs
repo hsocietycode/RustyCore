@@ -1,0 +1,105 @@
+//! IDT: CPU exception handlers + hardware IRQ handlers.
+//!
+//! Vectors 0..=31 are CPU exceptions (breakpoint, double fault, page fault,
+//! ...). Vectors 32..=47 are the remapped 8259 PIC (timer on 32, keyboard
+//! on 33). Anything else that fires lands in the GP handler and halts —
+//! loud failure beats silent corruption.
+
+use crate::gdt;
+use lazy_static::lazy_static;
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+
+/// PIC-remapped hardware IRQ vectors.
+pub const TIMER_VECTOR: u8 = 32;
+pub const KEYBOARD_VECTOR: u8 = 33;
+
+/// Timer ticks since `timer::init`. Written by the IRQ handler, read by main.
+pub static TIMER_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+lazy_static! {
+    static ref IDT: InterruptDescriptorTable = {
+        let mut idt = InterruptDescriptorTable::new();
+        idt.breakpoint.set_handler_fn(breakpoint_handler);
+        unsafe {
+            idt.double_fault
+                .set_handler_fn(double_fault_handler)
+                .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
+        }
+        idt.page_fault.set_handler_fn(page_fault_handler);
+        idt.general_protection_fault.set_handler_fn(gp_handler);
+        idt.stack_segment_fault
+            .set_handler_fn(stack_segment_handler);
+        idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
+        idt.divide_error.set_handler_fn(divide_error_handler);
+        idt[TIMER_VECTOR].set_handler_fn(timer_handler);
+        idt[KEYBOARD_VECTOR].set_handler_fn(keyboard_handler);
+        idt
+    };
+}
+
+/// Load the IDT. Call after [`crate::gdt::init`].
+pub fn init() {
+    IDT.load();
+}
+
+extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
+    crate::serial_println!("EXCEPTION: breakpoint\n{:#?}", stack_frame);
+}
+
+extern "x86-interrupt" fn double_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
+) -> ! {
+    panic!("EXCEPTION: double fault (code {error_code})\n{stack_frame:#?}");
+}
+
+extern "x86-interrupt" fn page_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: PageFaultErrorCode,
+) {
+    use x86_64::registers::control::Cr2;
+    panic!(
+        "EXCEPTION: page fault accessing {:#x} ({:?})\n{stack_frame:#?}",
+        Cr2::read_raw(),
+        error_code,
+    );
+}
+
+extern "x86-interrupt" fn gp_handler(stack_frame: InterruptStackFrame, error_code: u64) {
+    panic!("EXCEPTION: general protection fault (code {error_code:#x})\n{stack_frame:#?}");
+}
+
+extern "x86-interrupt" fn stack_segment_handler(stack_frame: InterruptStackFrame, error_code: u64) {
+    panic!("EXCEPTION: stack segment fault (code {error_code:#x})\n{stack_frame:#?}");
+}
+
+extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
+    panic!("EXCEPTION: invalid opcode\n{stack_frame:#?}");
+}
+
+extern "x86-interrupt" fn divide_error_handler(stack_frame: InterruptStackFrame) {
+    panic!("EXCEPTION: divide error\n{stack_frame:#?}");
+}
+
+extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
+    use core::sync::atomic::Ordering;
+    TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        crate::interrupts::PICS
+            .lock()
+            .notify_end_of_interrupt(TIMER_VECTOR);
+    }
+}
+
+extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
+    use x86_64::instructions::port::Port;
+    // Drain the scancode so the controller stops asserting IRQ1, then EOI.
+    // (No decoding yet — Phase 4 shell will do that.)
+    let scancode = unsafe { Port::<u8>::new(0x60).read() };
+    crate::serial_println!("keyboard: scancode {:#x} (ignored for now)", scancode);
+    unsafe {
+        crate::interrupts::PICS
+            .lock()
+            .notify_end_of_interrupt(KEYBOARD_VECTOR);
+    }
+}

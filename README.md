@@ -10,10 +10,17 @@ Org: https://github.com/hsocietycode
 Boots in QEMU today:
 
 ```
-RustyCore v0.1 - serial online, PIC remapped.
-memory: 505 MiB usable, heap 1024 KiB at 0xffff900000000000, phys offset 0xffff800000000000
-memory: heap smoke test ok (box=0xc0ffee, vec_len=2)
-RustyCore v0.1 - memory online, halting.
+RustyCore v0.2 - serial online.
+RustyCore v0.2 - GDT+TSS loaded (double-fault IST ready).
+RustyCore v0.2 - IDT loaded (exceptions + IRQ vectors live).
+RustyCore v0.2 - PIC remapped to 32..=47, all masked.
+memory: 248 MiB usable in 3 regions, heap 1024 KiB at 0xffff900000000000, phys offset 0xffff800000000000
+memory: heap self-test ok (len=66, sum=0xc107da)
+timer: PIT @ ~100 Hz, IRQ0 unmasked
+self-test: firing int3 breakpoint...
+self-test: breakpoint handler returned, IDT works.
+self-test: enabling interrupts, waiting for 100 timer ticks...
+self-test: 100 timer ticks seen, IRQs work. Phase 2 online. Halting.
 ```
 
 ## Prereqs
@@ -49,10 +56,13 @@ Cargo.toml           # workspace + release profile (opt3, LTO fat)
 rust-toolchain.toml  # nightly + rust-src
 .cargo/config.toml   # x86-64-v2 rustflags, `cargo xtask` alias
 config/kernel_config.toml
-kernel/              # no_std kernel (bootloader_api entry, serial, PIC)
-  src/main.rs        # entry: IF=0 (no IDT yet), serial+PIC init, halt
+kernel/              # no_std kernel (bootloader_api entry, serial, PIC, GDT/IDT, PIT)
+  src/main.rs        # entry: GDT+TSS → IDT → PIC → memory → PIT → self-tests → IF=1
   src/serial.rs      # COM1 polling driver (IER=0 — no UART IRQs before IDT)
   src/interrupts.rs  # 8259 remap to 32..47, all masked for now
+  src/gdt.rs         # GDT + TSS with double-fault IST escape stack
+  src/idt.rs         # exception handlers (breakpoint, DF/IST, PF, GP…) + IRQ0/IRQ1
+  src/timer.rs       # PIT channel 0 @ ~100 Hz, unmasks IRQ0
 xtask/               # host tools: build, image (BIOS), run-qemu
 docs/                # ROADMAP, design notes
 ```

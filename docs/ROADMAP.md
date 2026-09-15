@@ -19,9 +19,13 @@
 - [ ] Host unit-tests
 - [ ] UEFI image path (`bootloader` uefi feature + OVMF in xtask)
 
-## Phase 2 — Interrupts (v0.3)
-- [ ] GDT + TSS + IDT (then IF=1, UART IRQs on)
-- [ ] APIC + timer (замена PIC)
+## Phase 2 — Interrupts (v0.3) — DONE, boots in QEMU
+- [x] GDT + TSS (5-page double-fault IST stack) + IDT (exceptions + IRQ vectors)
+- [x] PIT @ ~100 Hz on IRQ0, `TIMER_TICKS` counter, keyboard IRQ1 stub
+- [x] IF=1 with live self-tests: `int3` returns, 100 timer ticks seen
+- [x] Boot proof: `self-test: breakpoint handler returned, IDT works.` /
+      `self-test: 100 timer ticks seen, IRQs work. Phase 2 online. Halting.`
+- [ ] APIC + timer (замена PIC) — next
 - [ ] Syscall stub
 
 ## Phase 3 — Process (v0.4)
