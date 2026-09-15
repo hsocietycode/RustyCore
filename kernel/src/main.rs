@@ -4,6 +4,7 @@
 
 extern crate alloc;
 
+mod apic;
 mod gdt;
 mod idt;
 mod interrupts;
@@ -40,6 +41,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("RustyCore v0.2 - IDT loaded (exceptions + IRQ vectors live).");
     interrupts::init();
     serial_println!("RustyCore v0.2 - PIC remapped to 32..=47, all masked.");
+
+    // APIC probe is read-only (CPUID + MSR), so it runs before memory
+    // init — memory::init takes boot_info by move, and the probe must
+    // not depend on heap or page tables anyway.
+    let apic = apic::probe(boot_info);
+    // Hard gate: every x86_64 machine worth booting has a local APIC.
+    // No APIC → no timer future → say so now, not three phases later.
+    assert!(
+        apic.present,
+        "no local APIC (CPUID bit 9 clear) — cannot continue"
+    );
 
     memory::init(boot_info);
 
