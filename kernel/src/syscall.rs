@@ -1,4 +1,4 @@
-//! Kernel-only `int 0x80` stub self-test (Step 2 registers, Step 6 fires).
+//! Kernel-only `int 0x80` stub self-test.
 //!
 //! No STAR/LSTAR, no swapgs, no ring-3 — just a software interrupt whose
 //! handler counts hits. Proves the 0x80 IDT entry is a live gate before any

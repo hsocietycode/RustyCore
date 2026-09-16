@@ -91,10 +91,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // and continue on the PIT alone. Never brick on a sidecar.
     apic::start_periodic().expect("apic start_periodic failed");
 
-    // Self-test #2: dual clock. Wait until BOTH clocks saw ~100 ticks
-    // (~1 second at 100 Hz each) — IRQ0 through the PIC and 0xEF from
-    // the LAPIC, side by side on the same serial line.
-    serial_println!("self-test: dual-clock soak (pic + apic, 100 ticks each)...");
+    // Self-test #2: dual clock. Wait until BOTH clocks reach the gate
+    // (SOAK_TICKS_EACH each, ~1 second at 100 Hz) — IRQ0 through the PIC
+    // and 0xEF from the LAPIC, side by side on the same serial line.
+    serial_println!("self-test: dual-clock soak (pic + apic, gate each)...");
 
     let mut spins: u64 = 0;
     let mut last_pic: u64 = 0;
@@ -135,11 +135,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // Busy `spin_loop`, NOT `hlt`: with both clocks dead no IRQ ever
         // arrives, so `hlt` would sleep forever past this guard — the old
         // code did exactly that (a guard that can never fire is dead code
-        // wearing a guard's name). 1B iterations is tens of seconds
-        // worst-case on TCG; the healthy path exits in ~1s, so a wide
-        // guard costs nothing when clocks live — and actually guards
-        // when they don't. Same discipline as `apic::calibrate`.
-        if spins > 1_000_000_000 {
+        // wearing a guard's name). Healthy path exits in ~1s; the guard
+        // width (tens of seconds worst-case on TCG) costs nothing when
+        // clocks live — and actually guards when they don't. Same
+        // discipline as `apic::calibrate`, wider for two-clock jitter.
+        if spins > crate::apic::SOAK_SPIN_GUARD {
             serial_println!(
                 "self-test FAILED: clocks stalled (pic={} apic=~{}), spun out. Halting.",
                 pic,
@@ -183,9 +183,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
     // Post-promotion watch: ~1s of LAPIC-only ticks. PIC IRQ0 is masked,
     // so TIMER_TICKS must freeze while APIC_TICKS climbs by a full gate.
-    // If the LAPIC stalls (no +20 in 1B spins), roll back to the PIT
-    // loudly — a promotion without a rollback plan is a leap, not
-    // engineering.
+    // If the LAPIC stalls, roll back to the PIT loudly — a promotion
+    // without a rollback plan is a leap, not engineering.
     serial_println!("self-test: promotion watch (LAPIC-only, ~1s)...");
     {
         use crate::idt::SOAK_TICKS_EACH;
@@ -213,7 +212,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 break;
             }
             spins += 1;
-            if spins > 1_000_000_000 {
+            // Same guard discipline as the soak: busy-spin (IRQs still
+            // arrive — the LAPIC is unmasked — but a STALLED lapic means
+            // `hlt` sleeps past the rollback forever). Healthy watch exits
+            // in ~1s; the width is patience for jitter, not sloth.
+            if spins > crate::apic::SOAK_SPIN_GUARD {
                 serial_println!(
                     "self-test: LAPIC STALLED post-promotion (apic +{} in guard window) — rolling back to PIT.",
                     apic_ticks - apic_base

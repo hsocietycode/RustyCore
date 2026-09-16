@@ -119,8 +119,8 @@ fn lapic_reg(win_base: u64, off: u64) -> Result<*mut u32, &'static str> {
 /// (device flags, NO_CACHE — see `map_mmio_window` for why not phys-offset),
 /// caches the window address for `eoi()`, then via volatile MMIO: enables
 /// via SVR (`0xF0 = 0x1FF`: spurious vector `0xFF` + enable bit 8), masks
-/// the LVT timer (`0x320 |= 1 << 16` — PIC stays the one true clock),
-/// zeroes TPR (`0x80 = 0`), and reports ID/VER/SVR.
+/// the LVT timer (`0x320 |= 1 << 16` — PIT stays master until Step 7
+/// promotes the LAPIC), zeroes TPR (`0x80 = 0`), and reports ID/VER/SVR.
 ///
 /// # Errors
 /// `Err` (never panics) when `probe.present` is false, the APIC is
@@ -196,6 +196,22 @@ const CALIB_PIT_TICKS: u32 = 10;
 /// boot — cheap against a clock that lies for the rest of uptime.
 const CALIB_ROUNDS: usize = 3;
 
+/// Busy-spin guard for the calibration windows (and the soak/watch loops
+/// in main, which mirror this discipline): 10M iterations is ~a second of
+/// wall time on QEMU TCG. The healthy path exits in microseconds, so a
+/// tight guard costs nothing when clocks live — and a guard that fires in
+/// seconds instead of minutes is the difference between a loud error and
+/// a CI timeout. (Was 100M: minutes of wall time on weak CI before the
+/// error surfaced.)
+const SPIN_GUARD: u64 = 10_000_000;
+
+/// Spin guard for the soak + promotion-watch loops in main: 100M
+/// iterations, ~tens of seconds worst-case on TCG. Wider than
+/// [`SPIN_GUARD`] on purpose — these loops watch TWO clocks through IRQ
+/// jitter, and the healthy path still exits in ~1–2s, so the width costs
+/// nothing when clocks live and buys patience when one leg stutters.
+pub const SOAK_SPIN_GUARD: u64 = 100_000_000;
+
 /// Pure tick math for [`calibrate`]: APIC ticks elapsed during `pit_ticks`
 /// PIT ticks at `pit_hz`, scaled to a 10 ms window. Saturating + div0-guarded
 /// so garbage inputs yield 0 (Step 5 treats 0 as "calibration failed",
@@ -254,16 +270,10 @@ pub fn calibrate() -> Result<u64, &'static str> {
             core::ptr::write_volatile(reg(ICR_OFFSET)?, 0xFFFF_FFFF);
 
             let start = crate::idt::TIMER_TICKS.load(Ordering::Relaxed);
-            // ~100 ms of PIT, then a spin-out guard: 10M busy iterations is
-            // ~a second of wall time on QEMU TCG — if the PIT is dead we say
-            // so instead of hanging. (Was 100M: minutes of wall time on weak
-            // CI before the error surfaced. The PIT path exits in
-            // microseconds when healthy, so a tight guard costs nothing on
-            // the happy path.)
-            // Busy `spin_loop` ON PURPOSE here, not `hlt`: with a
-            // dead PIT no IRQ ever arrives, so `hlt` would sleep forever and
-            // the guard below would never run. Burning ~100 ms of CPU per
-            // round is the price of a guard that actually guards.
+            // ~100 ms of PIT, then the shared spin guard. Busy `spin_loop`
+            // ON PURPOSE here, not `hlt`: with a dead PIT no IRQ ever
+            // arrives, so `hlt` would sleep forever past the guard — a guard
+            // that can never fire is dead code wearing a guard's name.
             let mut spins: u64 = 0;
             loop {
                 if crate::idt::TIMER_TICKS
@@ -274,7 +284,7 @@ pub fn calibrate() -> Result<u64, &'static str> {
                     break;
                 }
                 spins += 1;
-                if spins > 10_000_000 {
+                if spins > SPIN_GUARD {
                     return Err("apic: PIT produced no ticks during calibration — timer dead?");
                 }
                 core::hint::spin_loop();
@@ -377,20 +387,19 @@ pub fn eoi() -> Result<(), &'static str> {
 
 /// Promote the LAPIC timer to master clock (Step 7).
 ///
-/// Gates: the soak in main must have proven both clocks (`pic >= 100 &&
-/// apic >= 100`) before this is called — promoting on an unproven APIC
-/// would trade a working PIT for a silent box. This function trusts the
-/// caller on the gate (it cannot see the counters' history) and enforces
-/// the part it CAN see: window mapped, rate non-zero.
+/// Gates: the soak in main must have proven both clocks (each reaching
+/// [`crate::idt::SOAK_TICKS_EACH`]) before this is called — promoting on an
+/// unproven APIC would trade a working PIT for a silent box. This function
+/// trusts the caller on the gate (it cannot see the counters' history) and
+/// enforces the part it CAN see: window mapped, rate non-zero.
 ///
 /// What it does: masks IRQ0 on the PIC (IRQ1 keyboard stays — the LAPIC
 /// knows nothing of keystrokes), keeps the LAPIC periodic rate untouched,
 /// and returns. From here 0xEF is the one true tick; IRQ0 is silent.
 ///
 /// Rollback lives in the caller (main): if the LAPIC stalls post-promotion,
-/// `crate::interrupts::PICS.lock().write_masks(0xFC, 0xFF)` unmasks IRQ0
-/// and the PIT carries the kernel again. Promotion without a rollback plan
-/// is a leap, not engineering.
+/// [`rollback_to_pit`] unmasks IRQ0 and the PIT carries the kernel again.
+/// Promotion without a rollback plan is a leap, not engineering.
 pub fn promote() -> Result<(), &'static str> {
     use core::sync::atomic::Ordering;
     if LAPIC_VIRT.load(Ordering::Relaxed) == 0 {
@@ -399,10 +408,19 @@ pub fn promote() -> Result<(), &'static str> {
     if ticks_per_10ms() == 0 {
         return Err("apic: promote without a calibrated rate — refusing");
     }
+    // SAFETY: `read_masks`/`write_masks` are `unsafe` in pic8259 0.11
+    // because they poke real hardware ports — but here that IS the job:
+    // IRQ0/IRQ1 masks on the master PIC, nothing else moves. The PIC was
+    // remapped to 32..=47 at boot, so mask bits map to real IRQ lines.
+    // Mask IRQ0 (timer), keep IRQ1 (keyboard): read the live masks and
+    // set bit 0 of the master.
+    //
+    // NOTE on the read-modify-write window: this runs with IF=1, so IRQ0
+    // can fire between `read_masks` and `write_masks` — the handler takes
+    // the same lock, EOIs, and releases. That interleaving is harmless:
+    // EOI never touches masks, so the worst case is one extra PIT tick
+    // before the mask lands. No lost state, no corruption.
     unsafe {
-        // Mask IRQ0 (timer) on the master PIC, keep IRQ1 (keyboard):
-        // old master mask & 0x01-set... simplest honest shape is to ask
-        // the PIC for its current masks and set bit 0 of the master.
         let mut pics = crate::interrupts::PICS.lock();
         let masks = pics.read_masks();
         pics.write_masks(masks[0] | 0x01, masks[1]);
@@ -417,6 +435,8 @@ pub fn promote() -> Result<(), &'static str> {
 /// else untouched). Called when the post-promotion watch sees the LAPIC
 /// stall — the PIT, never disabled, resumes ticking immediately.
 pub fn rollback_to_pit() {
+    // SAFETY: same contract as `promote` — mask bit 0 → 0 on the master
+    // PIC, everything else untouched.
     unsafe {
         let mut pics = crate::interrupts::PICS.lock();
         let masks = pics.read_masks();
