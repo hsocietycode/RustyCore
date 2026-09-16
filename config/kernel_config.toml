@@ -18,9 +18,9 @@ quantum_us = 1000
 phys_offset = "0xFFFF800000000000"
 heap_size_kb = 1024
 stack_size = "128K"
-# bump = implemented; buddy = NOT YET (kernel refuses to build with it).
+# bump = bring-up (no reclaim); buddy = production (split/merge + reclaim).
 # Значение обязано совпадать с Cargo-фичой, иначе сборка падает с объяснением.
-frame_allocator = "bump" # bump | buddy (planned)
+frame_allocator = "buddy" # bump | buddy
 # Heap self-test (Box+Vec) при каждом буте. true = ловить битую кучу сразу,
 # false = пропустить ради скорости (heap всё равно инициализируется).
 self_test = true

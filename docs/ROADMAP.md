@@ -15,7 +15,7 @@
 - [x] Frame allocator: bump (`BootFrameAllocator` over Usable regions)
 - [x] Kernel heap 1 MiB (`linked_list_allocator`, Box+Vec smoke test ok)
 - [x] Boot proof: `memory: 505 MiB usable, heap 1024 KiB ... smoke test ok`
-- [ ] Buddy allocator (`alloc-buddy` feature) — next
+- [x] Buddy allocator (`alloc-buddy` feature, now default): two-phase bring-up (bump cursor pre-heap → free lists post-heap), split/merge + reclaim, boot self-test (alloc+free round-trip) — QEMU proof: 128851 free frames
 - [ ] Host unit-tests
 - [ ] UEFI image path (`bootloader` uefi feature + OVMF in xtask)
 

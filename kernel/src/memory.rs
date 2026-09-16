@@ -8,9 +8,15 @@
 //! `alloc-bump` (bring-up, no reclaim) or `alloc-buddy` (production).
 //! Heap size comes from `config/kernel_config.toml` (`heap_size_kb`).
 
+#[cfg(feature = "alloc-buddy")]
+mod buddy;
+#[cfg(feature = "alloc-bump")]
 mod bump;
 mod heap;
 
+#[cfg(feature = "alloc-buddy")]
+pub use buddy::BuddyFrameAllocator;
+#[cfg(feature = "alloc-bump")]
 pub use bump::BootFrameAllocator;
 
 use bootloader_api::{info::MemoryRegionKind, BootInfo};
@@ -52,20 +58,29 @@ const fn parse_heap_bytes() -> usize {
     n
 }
 
+/// One concrete allocator behind a type alias: bump for bring-up, buddy for
+/// production. An enum would work but bloats every stack slot that holds a
+/// mapper pair (`Buddy` carries 13 free-lists ≈ 320 bytes vs `Bump`'s ~24);
+/// the alias keeps `init`'s return type honest with zero indirection cost.
+/// Buddy additionally reclaims via `FrameDeallocator`, which `memory::init`
+/// exercises loudly.
+#[cfg(feature = "alloc-bump")]
+pub type FrameAlloc = BootFrameAllocator;
+#[cfg(feature = "alloc-buddy")]
+pub type FrameAlloc = BuddyFrameAllocator;
+
 /// Initialize frame allocator + heap, print a memory summary.
 ///
 /// Returns the page-table mapper and frame allocator so later boot steps
 /// (APIC MMIO mapping) can reuse them without rebuilding from raw tables.
-pub fn init(boot_info: &'static mut BootInfo) -> (OffsetPageTable<'static>, BootFrameAllocator) {
-    // Honesty gate, enforced at COMPILE time: `alloc-buddy` isn't
-    // implemented yet — selecting it (or nothing, or both) refuses to
-    // build instead of silently booting the wrong allocator.
+pub fn init(boot_info: &'static mut BootInfo) -> (OffsetPageTable<'static>, FrameAlloc) {
+    // Honesty gate, enforced at COMPILE time: exactly one allocator must be
+    // selected — both or neither refuses to build instead of silently
+    // booting the wrong one.
     #[cfg(all(feature = "alloc-bump", feature = "alloc-buddy"))]
     compile_error!("select exactly one of alloc-bump / alloc-buddy, not both");
     #[cfg(not(any(feature = "alloc-bump", feature = "alloc-buddy")))]
     compile_error!("select one of alloc-bump / alloc-buddy");
-    #[cfg(all(feature = "alloc-buddy", not(feature = "alloc-bump")))]
-    compile_error!("alloc-buddy is selected but not implemented yet — build with alloc-bump");
 
     let phys_offset = VirtAddr::new(
         boot_info
@@ -80,19 +95,40 @@ pub fn init(boot_info: &'static mut BootInfo) -> (OffsetPageTable<'static>, Boot
     );
 
     let mut mapper = unsafe { mapper(phys_offset) };
+    #[cfg(feature = "alloc-bump")]
     let mut frame_allocator = unsafe { BootFrameAllocator::new(&boot_info.memory_regions) };
+    #[cfg(feature = "alloc-buddy")]
+    let mut frame_allocator = unsafe { BuddyFrameAllocator::new(&boot_info.memory_regions) };
 
     heap::init(&mut mapper, &mut frame_allocator).expect("heap init failed");
 
+    // Buddy bring-up, phase two: the heap is live, so carve the REMAINDER of
+    // the map (everything the pre-heap bump cursor didn't consume) into real
+    // free lists. Before this point the allocator was a bump cursor — no heap
+    // use, no reclaim; after it, split/merge with reclaim. Bump skips this
+    // (nothing to activate — no reclaim by design).
+    #[cfg(feature = "alloc-buddy")]
+    frame_allocator.activate();
+
     let (usable_bytes, usable_regions) = usable_summary(&boot_info.memory_regions);
+    #[cfg(feature = "alloc-bump")]
+    let alloc_name = "bump";
+    #[cfg(feature = "alloc-buddy")]
+    let alloc_name = "buddy";
     crate::serial_println!(
-        "memory: {} MiB usable in {} regions, heap {} KiB at {:#x}, phys offset {:#x}",
+        "memory: {} MiB usable in {} regions, heap {} KiB at {:#x}, phys offset {:#x} (frames: {})",
         usable_bytes / 1024 / 1024,
         usable_regions,
         HEAP_SIZE / 1024,
         HEAP_START,
         phys_offset.as_u64(),
+        alloc_name,
     );
+
+    // Buddy proof: reclaim actually works — allocate a frame, free it, and
+    // confirm the free count returns. Bump has no reclaim (by design), so it
+    // only logs its one-way cursor. Loud either way, silent never.
+    self_test_reclaim(&mut frame_allocator);
 
     self_test(
         boot_info.memory_regions.len() as u64,
@@ -126,7 +162,42 @@ fn usable_summary(regions: &[bootloader_api::info::MemoryRegion]) -> (u64, usize
     (bytes, count)
 }
 
-/// Heap self-test: Box + Vec prove allocation, growth, and values work.
+/// Buddy reclaim proof: allocate one frame, free it, confirm the free count
+/// comes back. Runs at every boot under `alloc-buddy` — a non-reclaiming
+/// buddy is a bump with extra steps, and that lie dies here, loudly.
+#[cfg(feature = "alloc-buddy")]
+fn self_test_reclaim(alloc: &mut BuddyFrameAllocator) {
+    use x86_64::structures::paging::{FrameAllocator, FrameDeallocator};
+    let before = alloc.free_frames();
+    // SAFETY: the frame is freshly allocated by us, exclusively owned, and
+    // freed before anyone maps it — no aliasing window exists.
+    let frame = alloc
+        .allocate_frame()
+        .expect("buddy self-test: no frame to take");
+    let mid = alloc.free_frames();
+    assert_eq!(
+        before,
+        mid + 1,
+        "buddy self-test: allocate didn't consume a frame"
+    );
+    unsafe { alloc.deallocate_frame(frame) };
+    let after = alloc.free_frames();
+    assert_eq!(
+        before, after,
+        "buddy self-test: free didn't return the frame"
+    );
+    crate::serial_println!(
+        "memory: buddy self-test ok (free {} frames, alloc+free round-trips, allocated={})",
+        after,
+        alloc.allocated_frames(),
+    );
+}
+
+/// Bump has no reclaim — say so in the log instead of faking a reclaim test.
+#[cfg(feature = "alloc-bump")]
+fn self_test_reclaim(_alloc: &mut FrameAlloc) {
+    crate::serial_println!("memory: bump allocator (no reclaim by design)");
+}
 /// Gated by `[memory] self_test` in the config — `true` screams on a broken
 /// heap at every boot, `false` skips it for speed (heap still initializes).
 fn self_test(region_count: u64, enabled: bool) {
