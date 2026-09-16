@@ -385,6 +385,19 @@ pub struct Task {
     /// How many times this task has run. Starvation detector: at the end
     /// of the demo every task's count must be equal (round-robin promise).
     pub runs: u64,
+    /// Virtual runtime (CFS domain): nanoseconds-free tick units, scaled by
+    /// weight — a task accrues `CFS_BASE_SLICE * 1024 / weight` per step.
+    /// Equal-weight tasks accrue equally (CFS degenerates to fair RR); a
+    /// double-weight task accrues half as fast and is picked twice as often.
+    /// Compiled out under `sched-rr` (RR never reads it — no dead fields).
+    #[cfg(feature = "sched-cfs")]
+    pub vruntime: u64,
+    /// Scheduling weight (CFS domain). 1024 = nice-0 default; higher means
+    /// MORE cpu (vruntime accrues slower). Must be > 0 — zero would divide
+    /// by zero in the vruntime update (guarded by assert at spawn).
+    /// Compiled out under `sched-rr`.
+    #[cfg(feature = "sched-cfs")]
+    pub weight: u32,
     /// The task's private kernel stack. Owns the mapping — dropping the
     /// task frees its stack. The switch path runs ON this stack.
     pub stack: TaskStack,
@@ -396,9 +409,24 @@ pub struct Task {
     step: Box<dyn FnMut() -> bool>,
 }
 
+/// Default CFS weight (nice-0 equivalent): every task is equal until the
+/// caller says otherwise via [`Task::with_weight`]. CFS-only (RR has no
+/// weights — the field doesn't exist there).
+#[cfg(feature = "sched-cfs")]
+pub const CFS_DEFAULT_WEIGHT: u32 = 1024;
+
+/// CFS accounting slice per step in vruntime units. One step accrues
+/// `CFS_BASE_SLICE * 1024 / weight` — a default-weight task accrues exactly
+/// one slice per step; weights scale it inversely. Named, not magic.
+/// CFS-only.
+#[cfg(feature = "sched-cfs")]
+pub const CFS_BASE_SLICE: u64 = 100;
+
 impl Task {
     /// Build a task. Starts [`TaskState::Ready`], zero runs, fresh stack +
     /// bootstrapped context (first switch `ret`s into the trampoline).
+    /// Default CFS weight ([`CFS_DEFAULT_WEIGHT`]); override with
+    /// [`Task::with_weight`] before spawn.
     pub fn new(id: usize, name: &str, step: impl FnMut() -> bool + 'static) -> Self {
         let stack = TaskStack::new();
         let ctx = init_task_context(stack.top);
@@ -415,10 +443,25 @@ impl Task {
             name: String::from(name),
             state: TaskState::Ready,
             runs: 0,
+            #[cfg(feature = "sched-cfs")]
+            vruntime: 0,
+            #[cfg(feature = "sched-cfs")]
+            weight: CFS_DEFAULT_WEIGHT,
             stack,
             ctx,
             step: Box::new(step),
         }
+    }
+
+    /// Override the CFS weight before spawn. Consumes + returns Self so the
+    /// call chains at the spawn site (`Task::new(...).with_weight(...)`).
+    /// Panics on zero — a zero weight would divide by zero in vruntime math.
+    /// CFS-only (the field doesn't exist under RR).
+    #[cfg(feature = "sched-cfs")]
+    pub fn with_weight(mut self, weight: u32) -> Self {
+        assert!(weight > 0, "task weight must be > 0");
+        self.weight = weight;
+        self
     }
 
     /// Build a task parked asleep until `until_tick` (APIC_TICKS domain).
@@ -446,6 +489,10 @@ impl Task {
             name: String::from(name),
             state: TaskState::Sleeping { until_tick },
             runs: 0,
+            #[cfg(feature = "sched-cfs")]
+            vruntime: 0,
+            #[cfg(feature = "sched-cfs")]
+            weight: CFS_DEFAULT_WEIGHT,
             stack,
             ctx,
             step: Box::new(step),
@@ -465,6 +512,11 @@ pub trait Scheduler {
     /// Add a task to the ready set. Ids are assigned by the caller
     /// (main hands out 1, 2, 3...) — the scheduler never invents identity.
     fn spawn(&mut self, task: Task);
+
+    /// Hand out the next task id (1, 2, 3...). Lives on the trait (not just
+    /// the concrete type) so the driver can number tasks through
+    /// `Box<dyn Scheduler>` without knowing which policy is compiled in.
+    fn next_id(&mut self) -> usize;
 
     /// Run the next ready task once. Returns `false` when nothing is
     /// ready (all finished, or all sleeping — see below) — the caller
@@ -491,15 +543,14 @@ pub trait Scheduler {
 /// task gets an equal slice of schedule calls. No priorities, no vruntime
 /// — that sophistication is `sched-cfs`'s chapter, behind this same trait.
 ///
-/// Honesty gate (same style as `memory::init`): `sched-cfs` doesn't exist
-/// yet — selecting it (or nothing, or both) refuses to build instead of
-/// silently booting round-robin under a CFS name.
+/// Feature gate (same style as `memory::init`): exactly one scheduler
+/// policy must be selected — both or neither refuses to build instead of
+/// silently booting the wrong one.
 #[cfg(all(feature = "sched-rr", feature = "sched-cfs"))]
 compile_error!("select exactly one of sched-rr / sched-cfs, not both");
 #[cfg(not(any(feature = "sched-rr", feature = "sched-cfs")))]
 compile_error!("select one of sched-rr / sched-cfs");
-#[cfg(all(feature = "sched-cfs", not(feature = "sched-rr")))]
-compile_error!("sched-cfs is selected but not implemented yet — build with sched-rr");
+#[cfg(feature = "sched-rr")]
 pub struct RoundRobin {
     /// Boxed tasks: a `VecDeque` reallocates and shuffles addresses on
     /// push/pop — a saved `Context.rsp` pointing at a MOVED `Task` would
@@ -510,6 +561,7 @@ pub struct RoundRobin {
     next_id: usize,
 }
 
+#[cfg(feature = "sched-rr")]
 impl RoundRobin {
     /// Empty scheduler. Tasks arrive via [`Scheduler::spawn`].
     pub fn new() -> Self {
@@ -519,26 +571,26 @@ impl RoundRobin {
             next_id: 1,
         }
     }
-
-    /// Hand out the next task id (1, 2, 3...). Main uses this so task
-    /// numbering lives in one place, not scattered magic numbers.
-    pub fn next_id(&mut self) -> usize {
-        let id = self.next_id;
-        self.next_id += 1;
-        id
-    }
 }
 
+#[cfg(feature = "sched-rr")]
 impl Default for RoundRobin {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "sched-rr")]
 impl Scheduler for RoundRobin {
     fn spawn(&mut self, task: Task) {
         crate::serial_println!("sched: spawned task {}/{}", task.id, task.name);
         self.ready.push_back(Box::new(task));
+    }
+
+    fn next_id(&mut self) -> usize {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
     }
 
     fn schedule_once(&mut self) -> bool {
@@ -593,6 +645,155 @@ impl Scheduler for RoundRobin {
         }
         // Whole pass, nobody awake — all sleeping. Caller hlt-waits.
         false
+    }
+
+    fn alive(&self) -> usize {
+        self.ready.len()
+    }
+
+    fn ledger(&self) -> Vec<(usize, String, u64)> {
+        let mut out: Vec<(usize, String, u64)> = self
+            .ready
+            .iter()
+            .map(|t| (t.id, t.name.clone(), t.runs))
+            .collect();
+        out.extend(self.finished_runs.iter().cloned());
+        out.sort_by_key(|(id, _, _)| *id);
+        out
+    }
+}
+
+/// Completely Fair Scheduler: always run the lowest-vruntime task.
+///
+/// Same [`Scheduler`] trait as [`RoundRobin`], same switch machinery
+/// (tasks are `Box<Task>`, steps run on own stacks, no lock across `asm!`).
+/// The ONLY difference is pick-next: RR pops the head, CFS scans for the
+/// minimum vruntime. After each step the task accrues
+/// `CFS_BASE_SLICE * 1024 / weight` — equal weights accrue equally (CFS
+/// degenerates to fair round-robin), heavier weights accrue slower and get
+/// picked more often. Sleepers keep their vruntime while parked (no accrual
+/// without running — a sleeper must not gain unfair advantage), and a woken
+/// task is clamped to at most the current minimum (a long nap must not bank
+/// an unbeatable deficit — classic CFS sleeper-fairness).
+///
+/// O(n) scan today (four demo tasks — a linear pass is honest, not lazy).
+/// A real rbtree lands when the task count earns it.
+#[cfg(feature = "sched-cfs")]
+pub struct Cfs {
+    ready: VecDeque<Box<Task>>,
+    finished_runs: Vec<(usize, String, u64)>,
+    next_id: usize,
+}
+
+#[cfg(feature = "sched-cfs")]
+impl Cfs {
+    /// Empty scheduler. Tasks arrive via [`Scheduler::spawn`].
+    pub fn new() -> Self {
+        Self {
+            ready: VecDeque::new(),
+            finished_runs: Vec::new(),
+            next_id: 1,
+        }
+    }
+
+    /// Index of the awake task with the smallest vruntime. `None` when the
+    /// queue is empty or every task is still sleeping.
+    fn pick_min(&self, now: u64) -> Option<usize> {
+        let mut best: Option<(usize, u64)> = None;
+        for (i, t) in self.ready.iter().enumerate() {
+            // Sleepers are invisible to pick-next until their tick arrives.
+            if let TaskState::Sleeping { until_tick } = t.state {
+                if now < until_tick {
+                    continue;
+                }
+            }
+            match best {
+                None => best = Some((i, t.vruntime)),
+                Some((_, v)) if t.vruntime < v => best = Some((i, t.vruntime)),
+                _ => {}
+            }
+        }
+        best.map(|(i, _)| i)
+    }
+
+    /// Smallest vruntime among QUEUED tasks (sleepers included — they hold
+    /// their value while parked). Used to clamp a woken sleeper so a long
+    /// nap never banks an unbeatable deficit.
+    fn min_vruntime(&self) -> u64 {
+        self.ready.iter().map(|t| t.vruntime).min().unwrap_or(0)
+    }
+}
+
+#[cfg(feature = "sched-cfs")]
+impl Default for Cfs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "sched-cfs")]
+impl Scheduler for Cfs {
+    fn spawn(&mut self, task: Task) {
+        assert!(task.weight > 0, "cfs: refusing zero-weight task");
+        crate::serial_println!(
+            "sched: spawned task {}/{} (weight {})",
+            task.id,
+            task.name,
+            task.weight
+        );
+        self.ready.push_back(Box::new(task));
+    }
+
+    fn next_id(&mut self) -> usize {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    fn schedule_once(&mut self) -> bool {
+        use core::sync::atomic::Ordering;
+        let now = crate::idt::APIC_TICKS.load(Ordering::Relaxed);
+        let idx = match self.pick_min(now) {
+            Some(i) => i,
+            None => return false, // empty, or all sleeping — caller hlt-waits
+        };
+        let mut task = self.ready.remove(idx).expect("cfs pick_min lied");
+        // A woken sleeper rejoins at worst at the current minimum — never
+        // ahead of everyone by a banked nap.
+        if let TaskState::Sleeping { .. } = task.state {
+            let floor = self.min_vruntime();
+            if task.vruntime < floor {
+                task.vruntime = floor;
+            }
+            task.state = TaskState::Ready;
+        }
+        task.state = TaskState::Running;
+        unsafe {
+            switch_to_task(&mut *task as *mut Task);
+        }
+        // Back on the boot stack: accrue vruntime for the step just run.
+        // Saturating + divide-guarded: weight > 0 by spawn assert, but
+        // belt and suspenders — a zero here would be a div-by-zero in IRQ
+        // context's aftermath, and kernels don't do aftermaths.
+        let w = task.weight.max(1) as u64;
+        task.vruntime = task
+            .vruntime
+            .saturating_add(CFS_BASE_SLICE.saturating_mul(1024) / w);
+        if task.state == TaskState::Ready {
+            let v = task.vruntime;
+            crate::serial_println!("sched: task {}/{} vruntime={}", task.id, task.name, v);
+            self.ready.push_back(task);
+        } else {
+            crate::serial_println!(
+                "sched: task {}/{} finished after {} runs (vruntime={})",
+                task.id,
+                task.name,
+                task.runs,
+                task.vruntime
+            );
+            self.finished_runs.push((task.id, task.name, task.runs));
+        }
+        true
     }
 
     fn alive(&self) -> usize {

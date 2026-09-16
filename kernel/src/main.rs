@@ -238,29 +238,49 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // into the trampoline) — preemptive switch-from-IRQ is a later step.
     serial_println!("sched: phase 3 demo — 3 tasks + napper, own stacks, preempt clock...");
     {
-        use crate::task::{RoundRobin, Scheduler, Task};
+        use crate::task::{Scheduler, Task};
         use core::sync::atomic::Ordering;
         /// Runaway guard: 3 tasks × 5 steps = 15 schedules healthy.
         /// Anything past 100 is a stuck task (never returns false) —
         /// halt loudly instead of spinning forever.
         const SCHED_RUNAWAY_GUARD: u64 = 100;
-        /// Fairness bar: round-robin promises equal slices — every task
-        /// must show exactly this many runs at the ledger.
+        /// Fairness bar: promises equal slices — every task must show
+        /// exactly this many runs at the ledger (both policies: CFS with
+        /// equal weights degenerates to fair round-robin).
         const SCHED_FAIR_RUNS: u64 = 5;
-        let mut sched = RoundRobin::new();
+        // Policy pick by Cargo feature (build.rs guarantees the TOML agrees):
+        // one driver, two policies, zero `if feature` in the hot loop.
+        #[cfg(feature = "sched-rr")]
+        let mut sched = crate::task::RoundRobin::new();
+        #[cfg(feature = "sched-cfs")]
+        let mut sched = crate::task::Cfs::new();
         // Each task prints its own step and quits after SCHED_FAIR_RUNS —
         // the interleave in the log IS the proof of fair rotation. The
         // counter lives INSIDE the closure (mut move) — no shared state,
         // no Arc, each task owns its ledger line.
+        //
+        // Weight witness: under CFS gamma carries double weight (2048 vs
+        // 1024) — it must accrue vruntime half as fast and finish FIRST,
+        // proving weights actually steer pick-next instead of decorating
+        // the struct. Under RR weights don't exist (compiled out), so the
+        // spawn stays plain there — same demo shape, policy-specific proof.
         for name in ["alpha", "beta", "gamma"] {
             let id = sched.next_id();
             let tag = alloc::string::String::from(name);
             let mut n: u64 = 0;
-            sched.spawn(Task::new(id, name, move || {
+            let step = move || {
                 n += 1;
                 crate::serial_println!("task {}/{} step {}", id, tag, n);
                 n < SCHED_FAIR_RUNS
-            }));
+            };
+            #[cfg(feature = "sched-rr")]
+            sched.spawn(Task::new(id, name, step));
+            #[cfg(feature = "sched-cfs")]
+            if name == "gamma" {
+                sched.spawn(Task::new(id, name, step).with_weight(2048));
+            } else {
+                sched.spawn(Task::new(id, name, step));
+            }
         }
         // F3: the Sleeping arm needs a live witness — dead code in a kernel
         // is debt with interest. Task 4 naps until a LAPIC tick, proving
@@ -375,7 +395,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 x86_64::instructions::hlt();
             }
         }
+        #[cfg(feature = "sched-rr")]
         serial_println!("sched: round-robin fair (3×5 + napper×1). Phase 3 online. Halting.");
+        #[cfg(feature = "sched-cfs")]
+        serial_println!(
+            "sched: cfs fair (3×5 + napper×1, gamma first by weight). Phase 3 online. Halting."
+        );
     }
     loop {
         x86_64::instructions::hlt();

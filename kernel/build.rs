@@ -15,6 +15,7 @@ fn main() {
 
     let mut section = String::new();
     let mut frame_allocator_cfg: Option<String> = None;
+    let mut sched_cfg: Option<String> = None;
 
     for raw in config.lines() {
         let line = raw.trim();
@@ -59,6 +60,9 @@ fn main() {
             if section == "MEMORY" && upper == "FRAME_ALLOCATOR" {
                 frame_allocator_cfg = Some(v.to_lowercase());
             }
+            if section == "SCHED" && upper == "DEFAULT" {
+                sched_cfg = Some(v.to_lowercase());
+            }
         }
     }
 
@@ -72,6 +76,21 @@ fn main() {
         Some(other) => panic!(
             "kernel_config.toml [memory] frame_allocator={other:?} disagrees \
              with Cargo features (alloc-bump={bump}, alloc-buddy={buddy}): \
+             select exactly one, in both places"
+        ),
+        None => {}
+    }
+
+    // Same honesty for the scheduler: `[sched] default` must agree with the
+    // Cargo feature, otherwise the config promises a policy that never boots.
+    let rr = env::var("CARGO_FEATURE_SCHED_RR").is_ok();
+    let cfs = env::var("CARGO_FEATURE_SCHED_CFS").is_ok();
+    match sched_cfg.as_deref() {
+        Some("rr") if rr && !cfs => {}
+        Some("cfs") if cfs && !rr => {}
+        Some(other) => panic!(
+            "kernel_config.toml [sched] default={other:?} disagrees \
+             with Cargo features (sched-rr={rr}, sched-cfs={cfs}): \
              select exactly one, in both places"
         ),
         None => {}
