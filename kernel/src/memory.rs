@@ -220,7 +220,7 @@ pub fn map_heap(
     start: u64,
     size: usize,
 ) -> Result<(), &'static str> {
-    use x86_64::structures::paging::PageTableFlags;
+    use x86_64::structures::paging::{mapper::MapToError, PageTableFlags};
     if size == 0 {
         return Err("heap size is zero");
     }
@@ -234,10 +234,18 @@ pub fn map_heap(
         let frame: PhysFrame<Size4KiB> = frame_allocator
             .allocate_frame()
             .ok_or("out of frames for heap")?;
+        // Name the failure honestly: out-of-frames mid-map and an already-
+        // mapped page are different disasters with different fixes. The old
+        // code reported both as "already mapped" — a lie that sends the next
+        // debugger to the wrong crime scene.
         unsafe {
             mapper
                 .map_to(page, frame, flags, frame_allocator)
-                .map_err(|_| "heap page already mapped")?
+                .map_err(|e| match e {
+                    MapToError::FrameAllocationFailed => "heap map: out of frames for page tables",
+                    MapToError::ParentEntryHugePage => "heap map: huge page blocks heap range",
+                    MapToError::PageAlreadyMapped(_) => "heap page already mapped",
+                })?
                 .flush();
         }
     }

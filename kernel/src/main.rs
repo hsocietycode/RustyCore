@@ -97,14 +97,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("self-test: dual-clock soak (pic + apic, 100 ticks each)...");
 
     let mut spins: u64 = 0;
-    let mut last_printed: u64 = 0;
+    let mut last_pic: u64 = 0;
+    let mut last_apic: u64 = 0;
     loop {
         use core::sync::atomic::Ordering;
         let pic = idt::TIMER_TICKS.load(Ordering::Relaxed);
         let apic_ticks = idt::APIC_TICKS.load(Ordering::Relaxed);
-        // Progress every 20 PIC ticks — one line per ~200 ms, cheap.
-        if pic >= last_printed + 20 {
-            last_printed = pic;
+        // Progress every 20 ticks on EITHER leg — one line per ~200 ms.
+        // Either clock alone proves life, so watch both, not just the PIC:
+        // a dead PIC with a live APIC must still narrate, not go silent.
+        if pic >= last_pic + 20 || apic_ticks >= last_apic + 20 {
+            last_pic = pic;
+            last_apic = apic_ticks;
             serial_println!("tick: pic={} apic=~{}", pic, apic_ticks);
         }
         if pic >= 100 && apic_ticks >= 100 {
@@ -115,19 +119,42 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             serial_println!("apic-timer: NO IRQs (PIC ok, continuing)");
             break;
         }
+        // APIC whispering but lapped twice by the PIC without reaching 100?
+        // Degraded, not dead — report with counts, continue on the PIT.
+        // (apic==0 already broke above, so this arm is strictly 0<apic<100.)
+        if pic >= 200 && apic_ticks < 100 {
+            serial_println!(
+                "apic-timer: DEGRADED (pic={} apic=~{} after ~2s, PIC ok, continuing)",
+                pic,
+                apic_ticks
+            );
+            break;
+        }
         spins += 1;
-        // ~10M hlt-spins ≈ way past 1s even at 100 Hz; if we get here
-        // both clocks are dead and we say so instead of hanging forever.
-        if spins > 10_000_000 {
-            serial_println!("self-test FAILED: no ticks from either clock (spun out). Halting.");
+        // Busy `spin_loop`, NOT `hlt`: with both clocks dead no IRQ ever
+        // arrives, so `hlt` would sleep forever past this guard — the old
+        // code did exactly that (a guard that can never fire is dead code
+        // wearing a guard's name). 1B iterations is tens of seconds
+        // worst-case on TCG; the healthy path exits in ~1s, so a wide
+        // guard costs nothing when clocks live — and actually guards
+        // when they don't. Same discipline as `apic::calibrate`.
+        if spins > 1_000_000_000 {
+            serial_println!(
+                "self-test FAILED: clocks stalled (pic={} apic=~{}), spun out. Halting.",
+                pic,
+                apic_ticks
+            );
             loop {
                 x86_64::instructions::hlt();
             }
         }
-        x86_64::instructions::hlt(); // sleep until the next IRQ
+        core::hint::spin_loop();
     }
 
-    serial_println!("self-test: dual-clock soak done, both clocks live. Phase 2 online. Halting.");
+    serial_println!(
+        "self-test: dual-clock soak done, both clocks live (spurious={}). Phase 2 online. Halting.",
+        idt::SPURIOUS_HITS.load(core::sync::atomic::Ordering::Relaxed)
+    );
     loop {
         x86_64::instructions::hlt();
     }

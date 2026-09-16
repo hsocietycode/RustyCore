@@ -20,6 +20,16 @@ pub const SYSCALL_VECTOR: u8 = 0x80;
 pub const LAPIC_TIMER_VECTOR: u8 = 0xEF;
 pub const LAPIC_ERROR_VECTOR: u8 = 0xFE;
 
+/// Spurious vectors that can fire while masked — they MUST have handlers.
+/// The APIC spurious vector (`apic::init` programs SVR=0x1FF → vector 0xFF)
+/// and the classic PIC phantom IRQs (master IRQ7 → 39, slave IRQ15 → 47).
+/// Any OTHER unregistered vector that fires #GPs into the loud GP handler —
+/// that containment is by design, but these three are architecturally
+/// expected noise, not faults.
+pub const SPURIOUS_APIC_VECTOR: u8 = 0xFF;
+pub const SPURIOUS_PIC_MASTER_VECTOR: u8 = 39;
+pub const SPURIOUS_PIC_SLAVE_VECTOR: u8 = 47;
+
 /// Timer ticks since `timer::init`. Written by the IRQ handler, read by main.
 pub static TIMER_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -28,6 +38,10 @@ pub static APIC_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 
 /// `int 0x80` hits since boot. Kernel-only stub for now (Ring0, no STAR/LSTAR).
 pub static SYSCALL_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Spurious IRQ hits since boot (0xFF APIC + PIC phantom IRQ7/IRQ15).
+/// Expected noise, not faults — but counted, so silence-vs-noise is visible.
+pub static SPURIOUS_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 lazy_static! {
     static ref IDT: InterruptDescriptorTable = {
@@ -51,6 +65,13 @@ lazy_static! {
         idt[SYSCALL_VECTOR].set_handler_fn(syscall_stub_handler);
         idt[LAPIC_TIMER_VECTOR].set_handler_fn(apic_timer_handler);
         idt[LAPIC_ERROR_VECTOR].set_handler_fn(apic_error_handler);
+        // Spurious sinks (architecturally expected noise, not faults): the
+        // 0xFF APIC spurious vector SVR points at, and the two classic PIC
+        // phantom IRQs (master IRQ7 → 39, slave IRQ15 → 47). Count and EOI
+        // as spurious — never let phantom noise become a GP panic.
+        idt[SPURIOUS_APIC_VECTOR].set_handler_fn(spurious_handler);
+        idt[SPURIOUS_PIC_MASTER_VECTOR].set_handler_fn(spurious_pic_master_handler);
+        idt[SPURIOUS_PIC_SLAVE_VECTOR].set_handler_fn(spurious_pic_slave_handler);
         idt
     };
 }
@@ -156,5 +177,36 @@ extern "x86-interrupt" fn apic_error_handler(_stack_frame: InterruptStackFrame) 
     crate::serial_println!("apic: error interrupt (ESR unread in this step)");
     if let Err(e) = crate::apic::eoi() {
         crate::serial_println!("apic-error: stray fire ({}), ignored", e);
+    }
+}
+
+/// Spurious sinks: 0xFF (APIC), IRQ7/IRQ15 phantoms (PIC). Count and EOI —
+/// never panic on expected hardware noise.
+///
+/// The one asymmetry that matters: a master-IRQ7 phantom needs NO EOI (the
+/// 8259 never really raised it — acking would corrupt the in-service state
+/// machine), so `spurious_pic_master_handler` skips the ack deliberately,
+/// while the slave-IRQ15 phantom DOES need a master EOI (the cascade reached
+/// the slave). This is the classic 8259 errata dance, not an omission.
+extern "x86-interrupt" fn spurious_handler(_stack_frame: InterruptStackFrame) {
+    use core::sync::atomic::Ordering;
+    SPURIOUS_HITS.fetch_add(1, Ordering::Relaxed);
+    let _ = crate::apic::eoi();
+}
+
+extern "x86-interrupt" fn spurious_pic_master_handler(_stack_frame: InterruptStackFrame) {
+    use core::sync::atomic::Ordering;
+    SPURIOUS_HITS.fetch_add(1, Ordering::Relaxed);
+    // IRQ7 phantom: NO EOI by 8259 errata contract.
+}
+
+extern "x86-interrupt" fn spurious_pic_slave_handler(_stack_frame: InterruptStackFrame) {
+    use core::sync::atomic::Ordering;
+    SPURIOUS_HITS.fetch_add(1, Ordering::Relaxed);
+    // IRQ15 phantom: EOI to MASTER only (the slave never raised).
+    unsafe {
+        crate::interrupts::PICS
+            .lock()
+            .notify_end_of_interrupt(SPURIOUS_PIC_MASTER_VECTOR);
     }
 }

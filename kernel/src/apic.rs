@@ -211,9 +211,7 @@ pub fn calibrate_ticks(delta: u32, pit_hz: u32, pit_ticks: u32) -> u64 {
 ///
 /// One-shot, no LAPIC IRQs: DCR = divide-by-16, ICR = 0xFFFFFFFF, then
 /// burn ~100 ms of CPU waiting for `TIMER_TICKS` to advance
-/// `CALIB_PIT_TICKS` PIT ticks, and read CCR.
-///
-/// Requires IF=1 — the PIT ruler advances via IRQ0, and with IF=0 no ticks
+/// `CALIB_PIT_TICKS` PIT ticks, and read CCR./// Requires IF=1 — the PIT ruler advances via IRQ0, and with IF=0 no ticks
 /// ever arrive. Busy-wait (not `hlt`) deliberately: if the PIT itself is
 /// dead, `hlt` would sleep forever past the spin-out guard below, while a
 /// busy loop trips the guard in seconds and reports it. Main enables
