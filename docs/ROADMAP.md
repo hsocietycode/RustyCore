@@ -31,7 +31,7 @@
 ## Phase 3 — Process (v0.4)
 - [x] Step 1: `trait Scheduler` + `sched-rr` (cooperative, all-asleep fix, napper witness)
 - [x] Step 2a: per-task `TaskStack` (128K heap-backed, 16B-aligned top) + preemption clock (`timer_tick` from LAPIC handler, `NEED_RESCHED` every 10 ticks, preempt points interleaved in demo log)
-- [ ] Step 2b: real context switch (`asm!`, register save/restore, `TSS.rsp0`) under the same `Scheduler` trait
+- [x] Step 2b: real context switch (`#[unsafe(naked)]` save/restore callee-saved + RSP, fake-frame bootstrap, `task_trampoline`, `Box<Task>` queue, `TSS.rsp0` proof-of-path, stack canary, `-C no-redzone=yes`) — boot proof: interleaved steps on own stacks, rsp0 per switch, 2 preempt points, ledger 5-5-5-1
 - [ ] `sched-cfs` policy behind the same trait
 - [ ] User mode ring3 + ELF loader
 - [ ] RAMFS → FAT32

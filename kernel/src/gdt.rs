@@ -56,6 +56,29 @@ struct Selectors {
     tss_selector: SegmentSelector,
 }
 
+/// Update `TSS.rsp0` — the ring-0 stack the CPU loads on a ring transition.
+///
+/// No hardware reads it today (everything runs at CPL 0 — the CPU keeps the
+/// current RSP on interrupts instead). The scheduler calls this on EVERY
+/// switch as proof of the path: the hook exists, the value is right, and
+/// when ring 3 arrives the exact same call becomes the privilege-stack
+/// switch. Deferred until then: separate user stacks, syscall MSRs, guard
+/// pages, IST for NMI/#MC.
+///
+/// # Safety
+/// Writes a live TSS field. Single CPU + cooperative switch (interrupts
+/// disabled around the call) — no concurrent reader can observe a half
+/// write on a 64-bit aligned store.
+pub fn set_rsp0(top: u64) {
+    unsafe {
+        // `&raw mut` through the lazy_static — the TSS lives for the whole
+        // boot, and this is the only writer (no aliasing reader exists).
+        let tss_ptr = &raw mut *(&raw const *TSS as *mut TaskStateSegment);
+        (*tss_ptr).privilege_stack_table[0] = VirtAddr::new(top);
+    }
+    crate::serial_println!("gdt: rsp0 -> {:#x}", top);
+}
+
 /// Load the GDT, reload segment registers, and load the TSS.
 pub fn init() {
     use x86_64::instructions::segmentation::Segment as _;

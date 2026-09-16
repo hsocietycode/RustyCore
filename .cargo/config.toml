@@ -8,4 +8,11 @@ xtask = "run -p xtask --"
 # rust-lld ships with the toolchain (llvm-tools-preview) — lets us link
 # the kernel without a system C toolchain (no cc/gcc needed).
 linker = "rust-lld"
-rustflags = ["-C", "target-cpu=x86-64-v2", "-C", "force-frame-pointers=no"]
+rustflags = [
+  "-C", "target-cpu=x86-64-v2",
+  "-C", "force-frame-pointers=no",
+  # No red zone in the kernel: interrupt handlers and the context switch
+  # run on task stacks where the 128 bytes below RSP are NOT reserved —
+  # leaf functions scribbling there would corrupt handler frames.
+  "-C", "no-redzone=yes",
+]
