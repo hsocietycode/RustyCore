@@ -229,12 +229,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             core::hint::spin_loop();
         }
     }
-    // Phase 3, Step 1: cooperative tasks on top of the LAPIC clock.
-    // Three demo tasks yield to each other through the round-robin
-    // scheduler — the log shows the interleave, the ledger proves
-    // nobody starved. No stacks or context switch yet (Step 2);
-    // the scheduler trait won't even notice when they land.
-    serial_println!("sched: phase 3 demo — 3 tasks, round-robin...");
+    // Phase 3, Step 2a: tasks with OWN stacks + a preemption clock.
+    // Three demo tasks yield through the round-robin scheduler — the log
+    // shows the interleave, each stack top is printed at spawn, and every
+    // QUANTUM_TICKS-th LAPIC tick raises a preempt point that main observes
+    // and logs. The switch itself (Step 2b's `asm!`) isn't here yet — the
+    // handler only raises the flag, main only counts it — but the whole
+    // timer→policy path is proven live in this boot.
+    serial_println!("sched: phase 3 demo — 3 tasks + napper, own stacks, preempt clock...");
     {
         use crate::task::{RoundRobin, Scheduler, Task};
         use core::sync::atomic::Ordering;
@@ -281,8 +283,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 false
             }));
         }
-        // Drive the scheduler until every task finishes. Cooperative —
-        // no timer preemption yet, just back-to-back steps.
+        // Drive the scheduler until every task finishes. Still driven from
+        // main (the switch lands in 2b), but every pass observes the
+        // preemption flag the LAPIC handler raises: a taken flag logs a
+        // preempt point with the tick, proving the timer→policy path live.
         //
         // F2 fix: `schedule_once() == false` with `alive() > 0` means ALL
         // tasks are sleeping — NOT done. The old code `break`ed straight
@@ -292,7 +296,27 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         // A consecutive-false counter trips the runaway guard if ticks die.
         let mut schedules: u64 = 0;
         let mut asleep_passes: u64 = 0;
+        let mut preempts: u64 = 0;
+        // Drain any quantum flag raised before the demo started (soak +
+        // promotion watch ticked ~200 times with nobody observing) — the
+        // first logged preempt point must come from THIS loop, not stale.
+        crate::task::take_preempt_flag();
+        // Pace the demo on real LAPIC ticks: wait for a FRESH tick before
+        // every schedule. 16 schedules then span ~16 ticks > QUANTUM_TICKS,
+        // so quanta expire MID-demo and preempt points interleave with task
+        // steps instead of landing after the finish lines. IF=1 here
+        // (enabled before calibrate, never disabled).
+        let mut last_tick = crate::idt::APIC_TICKS.load(Ordering::Relaxed);
         while sched.alive() > 0 {
+            // Wait for the next LAPIC tick (hlt-sleep; the LAPIC is live).
+            loop {
+                let cur = crate::idt::APIC_TICKS.load(Ordering::Relaxed);
+                if cur != last_tick {
+                    last_tick = cur;
+                    break;
+                }
+                x86_64::instructions::hlt(); // sleep until the next LAPIC tick
+            }
             if !sched.schedule_once() {
                 asleep_passes += 1;
                 if asleep_passes > SCHED_RUNAWAY_GUARD {
@@ -301,11 +325,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                         x86_64::instructions::hlt();
                     }
                 }
-                x86_64::instructions::hlt(); // sleep until the next LAPIC tick
                 continue;
             }
             asleep_passes = 0;
             schedules += 1;
+            // Step 2a proof: the handler raised NEED_RESCHED during this
+            // pass — a quantum expired, the policy noticed. Log it loudly.
+            if crate::task::take_preempt_flag() {
+                preempts += 1;
+                serial_println!(
+                    "sched: preempt point {} at apic tick ~{}",
+                    preempts,
+                    crate::idt::APIC_TICKS.load(Ordering::Relaxed)
+                );
+            }
             if schedules > SCHED_RUNAWAY_GUARD {
                 serial_println!(
                     "sched FAILED: runaway ({} schedules, tasks still alive). Halting.",
@@ -314,6 +347,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 loop {
                     x86_64::instructions::hlt();
                 }
+            }
+        }
+        // Step 2a gate: at least one quantum must have expired mid-demo.
+        // Zero preempt points means the timer→policy path is dead (flag
+        // never raised, or never observed) — say so loudly, not silently.
+        if preempts == 0 {
+            serial_println!("sched FAILED: preemption clock silent (0 quanta in demo). Halting.");
+            loop {
+                x86_64::instructions::hlt();
             }
         }
         // The ledger: alpha/beta/gamma must show exactly SCHED_FAIR_RUNS

@@ -32,4 +32,4 @@ jobs:
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq qemu-system-x86
           timeout 150 cargo xtask run-qemu > boot.log 2>&1 || true
-          grep -a "Phase 2 online" boot.log
+          grep -aE "Phase [23] online" boot.log

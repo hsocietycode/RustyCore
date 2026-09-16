@@ -1,25 +1,118 @@
-//! Cooperative tasks — Phase 3, Step 1.
+//! Preemptive foundations — Phase 3, Step 2a.
 //!
 //! The scene so far: the LAPIC ticks at ~100 Hz into `APIC_TICKS`, memory
-//! is bump-allocated, interrupts are live. What we DON'T have yet: a stack
-//! per task, a saved register file, a real context switch — that hardware
-//! needs `TSS.rsp0`, a per-task page table story, and a sweaty afternoon
-//! with `asm!`. This step builds everything UP TO that line:
+//! is bump-allocated, interrupts are live, and Step 1 proved the scheduler
+//! logic cooperatively. What we DON'T have yet: a saved register file and
+//! a real context switch — that hardware needs `TSS.rsp0`, a per-task page
+//! table story, and a sweaty afternoon with `asm!` (Step 2b). This step
+//! builds everything UP TO that line:
 //!
-//! - [`Task`]: an id, a name, a state, a step function, a run counter.
+//! - [`Task`]: an id, a name, a state, a step function, a run counter —
+//!   plus its OWN [`TaskStack`] (heap-backed, 16-byte-aligned top).
 //! - [`Scheduler`]: the trait Phase 3 promises (`sched-rr` now, `sched-cfs`
 //!   later) — pick-next + tick accounting live here, behind one interface.
 //! - [`RoundRobin`]: a VecDeque of ready tasks, FIFO with requeue.
-//! - A boot demo: three tasks yield to each other N rounds, the log shows
-//!   the interleave, the counters prove nobody starved.
-//!
-//! Why cooperative first: a preemptive switch needs the full context
-//! machinery, but the SCHEDULER (who runs next? who starved? who hogs?)
-//! is pure logic — testable today, on top of LAPIC ticks, with zero asm.
-//! Step 2 will add stacks + context switch UNDER this same trait, and the
-//! demo tasks won't even notice.
+//! - Preemption clock: [`timer_tick`] (called from the LAPIC handler, IRQ
+//!   context, atomics only) raises [`NEED_RESCHED`] every [`QUANTUM_TICKS`]
+//!   ticks; main observes it via [`take_preempt_flag`] and logs each
+//!   preempt point. The handler never schedules — it only raises the flag.
+//! - A boot demo: three tasks + a napper, stacks printed at spawn, the log
+//!   shows the interleave AND the preempt points, the ledger proves nobody
+//!   starved.
 
 use alloc::{collections::VecDeque, string::String, vec::Vec};
+
+/// Per-task kernel stack size in bytes, wired from `stack_size = "128K"` in
+/// `config/kernel_config.toml` by build.rs (decimal bytes string).
+pub const STACK_SIZE_BYTES: usize = parse_stack_bytes();
+
+const fn parse_stack_bytes() -> usize {
+    let s = env!("KERNEL_CONFIG_STACK_SIZE_BYTES").as_bytes();
+    let mut n: usize = 0;
+    let mut i = 0;
+    while i < s.len() {
+        let d = s[i].wrapping_sub(b'0');
+        assert!(d < 10, "stack_size must be digits");
+        n = n * 10 + d as usize;
+        i += 1;
+    }
+    n
+}
+
+/// Preemption quantum in LAPIC ticks. The LAPIC ticks at ~100 Hz, so 10 ticks
+/// ≈ 100 ms per task before the timer asks for a reschedule. Named, not
+/// magic — Step 2b will enforce this in the switch path; Step 2a only
+/// accounts (sets the flag, main observes it).
+pub const QUANTUM_TICKS: u64 = 10;
+
+/// Set by [`timer_tick`] when a quantum expires, cleared by main when it
+/// observes a reschedule point. The LAPIC handler never schedules directly
+/// (no locking, no queue surgery at IRQ time) — it only raises the flag.
+pub static NEED_RESCHED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Ticks seen by the scheduler layer (mirrors `APIC_TICKS`, counted here so
+/// the preemption policy owns its own clock reading).
+pub static PREEMPT_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Called from the LAPIC timer handler (IRQ context): cheap atomics only,
+/// no locking, no printing — serial from IRQ time risks reentrancy with
+/// main's own prints. Every [`QUANTUM_TICKS`]-th tick raises NEED_RESCHED.
+pub fn timer_tick() {
+    use core::sync::atomic::Ordering;
+    let t = PREEMPT_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    if t.is_multiple_of(QUANTUM_TICKS) {
+        NEED_RESCHED.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Take the reschedule flag (swap to false): `true` means a quantum expired
+/// since the last check. Main calls this at schedule points — IRQ time only
+/// ever SETS the flag, never clears it, so no tick is lost between checks.
+pub fn take_preempt_flag() -> bool {
+    NEED_RESCHED.swap(false, core::sync::atomic::Ordering::Relaxed)
+}
+
+/// A per-task kernel stack: a heap-backed region whose top is 16-byte
+/// aligned (SysV ABI contract — Step 2b's context switch will `ret` onto
+/// it, and a misaligned stack is a silent SSE fault waiting to happen).
+pub struct TaskStack {
+    /// Owning backing store — dropping the task frees its stack.
+    _backing: alloc::boxed::Box<[u8]>,
+    /// Virtual address of the stack TOP (stacks grow down; the switch
+    /// path loads this into RSP on first run).
+    pub top: u64,
+    /// Virtual address of the stack bottom (for guard-page math later).
+    pub bottom: u64,
+}
+
+impl TaskStack {
+    /// Allocate a fresh stack. Panics loudly on OOM — a task without a
+    /// stack is not a task, and booting past it would corrupt memory.
+    pub fn new() -> Self {
+        use alloc::vec;
+        let backing: alloc::boxed::Box<[u8]> = vec![0u8; STACK_SIZE_BYTES].into_boxed_slice();
+        let bottom = backing.as_ptr() as u64;
+        // Top aligned down to 16 — Vec backing is already aligned, but
+        // assert the contract instead of assuming the allocator.
+        let top = (bottom + STACK_SIZE_BYTES as u64) & !0xF;
+        assert!(
+            top > bottom,
+            "task stack top underflowed bottom — size misconfigured?"
+        );
+        Self {
+            _backing: backing,
+            top,
+            bottom,
+        }
+    }
+}
+
+impl Default for TaskStack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// What a task is doing right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,12 +130,14 @@ pub enum TaskState {
     Finished,
 }
 
-/// A cooperative task: a named step function with an id and a ledger.
+/// A task: a named step function with an id, a ledger, and its own stack.
 ///
 /// The step function runs once per schedule and returns `true` to stay
-/// ready or `false` to finish. No stacks, no registers yet — the "context"
-/// is whatever the closure captures. Real stacks land in Step 2 UNDER this
-/// same shape: `step` keeps its signature, the scheduler keeps its trait.
+/// ready or `false` to finish. Step 2a: every task OWNS a [`TaskStack`]
+/// (heap-backed, 16-byte-aligned top) — allocated at spawn, freed on drop.
+/// The switch path doesn't use it yet (Step 2b's `asm!`), but allocation
+/// under heap pressure is proven today: 4 demo tasks × 128 KiB = 512 KiB
+/// of the 1 MiB heap, and the boot log prints each stack top.
 pub struct Task {
     /// Stable number, handed out by the scheduler. Log lines carry it so
     /// the interleave is readable (`task 1/alpha`, not anonymous noise).
@@ -54,18 +149,31 @@ pub struct Task {
     /// How many times this task has run. Starvation detector: at the end
     /// of the demo every task's count must be equal (round-robin promise).
     pub runs: u64,
+    /// The task's private kernel stack. Unused by the Step-1 schedule path
+    /// (the closure runs on main's stack) — Step 2b's context switch will
+    /// load `stack.top` into RSP. Kept alive here so the mapping stays owned.
+    pub stack: TaskStack,
     /// The work. `FnMut` — tasks may mutate captured state across runs.
     step: alloc::boxed::Box<dyn FnMut() -> bool>,
 }
 
 impl Task {
-    /// Build a task. Starts [`TaskState::Ready`], zero runs.
+    /// Build a task. Starts [`TaskState::Ready`], zero runs, fresh stack.
     pub fn new(id: usize, name: &str, step: impl FnMut() -> bool + 'static) -> Self {
+        let stack = TaskStack::new();
+        crate::serial_println!(
+            "sched: task {}/{} stack top {:#x} ({} KiB)",
+            id,
+            name,
+            stack.top,
+            STACK_SIZE_BYTES / 1024
+        );
         Self {
             id,
             name: String::from(name),
             state: TaskState::Ready,
             runs: 0,
+            stack,
             step: alloc::boxed::Box::new(step),
         }
     }
@@ -79,18 +187,46 @@ impl Task {
         until_tick: u64,
         step: impl FnMut() -> bool + 'static,
     ) -> Self {
+        let stack = TaskStack::new();
+        crate::serial_println!(
+            "sched: task {}/{} stack top {:#x} ({} KiB)",
+            id,
+            name,
+            stack.top,
+            STACK_SIZE_BYTES / 1024
+        );
         Self {
             id,
             name: String::from(name),
             state: TaskState::Sleeping { until_tick },
             runs: 0,
+            stack,
             step: alloc::boxed::Box::new(step),
         }
     }
 
     /// Run one step. Returns `true` = still ready, `false` = finished.
     /// Increments the run ledger either way — an attempt is an attempt.
+    ///
+    /// Step 2a stack check: the closure still runs on main's stack (the
+    /// switch lands in 2b), but every step re-validates the owned stack's
+    /// invariants — 16-byte-aligned top, top above bottom — so a corrupt or
+    /// misconfigured stack screams HERE, not deep inside future `asm!`.
+    /// This also keeps `stack`/`bottom` honestly read, never `allow`ed.
     fn run_step(&mut self) -> bool {
+        debug_assert_eq!(
+            self.stack.top % 16,
+            0,
+            "task {}/{} stack top misaligned",
+            self.id,
+            self.name
+        );
+        debug_assert!(
+            self.stack.top > self.stack.bottom,
+            "task {}/{} stack top below bottom",
+            self.id,
+            self.name
+        );
         self.state = TaskState::Running;
         self.runs += 1;
         let alive = (self.step)();
