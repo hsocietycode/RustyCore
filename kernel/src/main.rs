@@ -11,6 +11,7 @@ mod interrupts;
 mod memory;
 mod serial;
 mod syscall;
+mod task;
 mod timer;
 
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
@@ -205,7 +206,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             if apic_ticks - apic_base >= SOAK_TICKS_EACH {
                 let pic_now = idt::TIMER_TICKS.load(Ordering::Relaxed);
                 serial_println!(
-                    "self-test: LAPIC master proven (apic +{} like the gate, pic frozen at {}). Phase 2 online. Halting.",
+                    "self-test: LAPIC master proven (apic +{} like the gate, pic frozen at {}).",
                     apic_ticks - apic_base,
                     pic_now
                 );
@@ -227,6 +228,66 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
             core::hint::spin_loop();
         }
+    }
+    // Phase 3, Step 1: cooperative tasks on top of the LAPIC clock.
+    // Three demo tasks yield to each other through the round-robin
+    // scheduler — the log shows the interleave, the ledger proves
+    // nobody starved. No stacks or context switch yet (Step 2);
+    // the scheduler trait won't even notice when they land.
+    serial_println!("sched: phase 3 demo — 3 tasks, round-robin...");
+    {
+        use crate::task::{RoundRobin, Scheduler, Task};
+        let mut sched = RoundRobin::new();
+        // Each task prints its own step and quits after 5 runs — the
+        // interleave in the log IS the proof of fair rotation. The counter
+        // lives INSIDE the closure (mut move) — no shared state, no Arc,
+        // each task owns its ledger line.
+        for name in ["alpha", "beta", "gamma"] {
+            let id = sched.next_id();
+            let tag = alloc::string::String::from(name);
+            let mut n: u64 = 0;
+            sched.spawn(Task::new(id, name, move || {
+                n += 1;
+                crate::serial_println!("task {}/{} step {}", id, tag, n);
+                n < 5
+            }));
+        }
+        // Drive the scheduler until every task finishes. Cooperative —
+        // no timer preemption yet, just back-to-back steps. A stuck task
+        // (never returns false) would spin here forever, so the guard
+        // counts schedules: 3 tasks × 5 steps = 15, anything past 100
+        // is a runaway, halt loudly.
+        let mut schedules: u64 = 0;
+        while sched.alive() > 0 {
+            if !sched.schedule_once() {
+                break;
+            }
+            schedules += 1;
+            if schedules > 100 {
+                serial_println!(
+                    "sched FAILED: runaway (100 schedules, tasks still alive). Halting."
+                );
+                loop {
+                    x86_64::instructions::hlt();
+                }
+            }
+        }
+        // The ledger: every task must show exactly 5 runs — round-robin
+        // fairness made visible. Unequal counts mean the queue lied.
+        let mut fair = true;
+        for (id, name, runs) in sched.ledger() {
+            serial_println!("sched ledger: task {}/{} runs={}", id, name, runs);
+            if runs != 5 {
+                fair = false;
+            }
+        }
+        if !fair {
+            serial_println!("sched FAILED: unfair ledger (not all runs==5). Halting.");
+            loop {
+                x86_64::instructions::hlt();
+            }
+        }
+        serial_println!("sched: round-robin fair (3 tasks × 5 steps). Phase 3 online. Halting.");
     }
     loop {
         x86_64::instructions::hlt();
