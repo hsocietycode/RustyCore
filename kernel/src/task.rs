@@ -55,9 +55,10 @@ const fn parse_stack_bytes() -> usize {
 }
 
 /// Preemption quantum in LAPIC ticks. The LAPIC ticks at ~100 Hz, so 10 ticks
-/// ≈ 100 ms per task before the timer asks for a reschedule. Named, not
-/// magic — Step 2b will enforce this in the switch path; Step 2a only
-/// accounts (sets the flag, main observes it).
+/// ≈ 100 ms before the timer asks for a reschedule. Named, not magic — the
+/// flag is still observed-only (the driver logs preempt points); ENFORCING
+/// the quantum (yanking a running task mid-step) is the preemptive step's
+/// job, not this cooperative one's.
 pub const QUANTUM_TICKS: u64 = 10;
 
 /// Set by [`timer_tick`] when a quantum expires, cleared by main when it
@@ -124,6 +125,13 @@ static mut SCHED_CTX: Context = Context::empty();
 /// runs on the boot stack). Set by the driver just before switching in,
 /// read by the trampoline to find whose step to run. Raw pointer, not a
 /// reference — no borrow crosses the `asm!` boundary, ever.
+///
+/// Lifetime protocol: the pointer is valid only while its `Box<Task>` is
+/// alive in the driver's hand. A finished task's Box is dropped at the end
+/// of the `schedule_once` iteration, leaving this dangling — but nobody
+/// reads it in that window: the trampoline reads it ONLY right after a
+/// switch that the driver set up, and every switch sets it fresh first.
+/// Single CPU + cooperative = no preemptive reader can slip between.
 static mut CURRENT_TASK: *mut Task = core::ptr::null_mut();
 
 /// Naked context switch: save callee-saved + RSP into `*old`, load them

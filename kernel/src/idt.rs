@@ -171,9 +171,10 @@ extern "x86-interrupt" fn syscall_stub_handler(_stack_frame: InterruptStackFrame
 extern "x86-interrupt" fn apic_timer_handler(_stack_frame: InterruptStackFrame) {
     use core::sync::atomic::Ordering;
     APIC_TICKS.fetch_add(1, Ordering::Relaxed);
-    // Phase 3 Step 2a: feed the preemption policy its clock. Cheap atomics
+    // Phase 3 Step 2b: feed the preemption policy its clock. Cheap atomics
     // only — no locking, no printing at IRQ time (serial reentrancy with
-    // main's prints would garble the log). The flag is observed by main.
+    // task prints would garble the log; the handler also runs on task
+    // stacks now, so minimal frame usage matters). The driver observes it.
     crate::task::timer_tick();
     if let Err(e) = crate::apic::eoi() {
         crate::serial_println!("apic-timer: stray fire ({}), ignored", e);

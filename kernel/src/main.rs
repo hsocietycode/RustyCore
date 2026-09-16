@@ -229,13 +229,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             core::hint::spin_loop();
         }
     }
-    // Phase 3, Step 2a: tasks with OWN stacks + a preemption clock.
-    // Three demo tasks yield through the round-robin scheduler — the log
-    // shows the interleave, each stack top is printed at spawn, and every
-    // QUANTUM_TICKS-th LAPIC tick raises a preempt point that main observes
-    // and logs. The switch itself (Step 2b's `asm!`) isn't here yet — the
-    // handler only raises the flag, main only counts it — but the whole
-    // timer→policy path is proven live in this boot.
+    // Phase 3, Step 2b: tasks run ON their own stacks via a real naked-asm
+    // switch. Three demo tasks yield through the round-robin scheduler — the
+    // log shows the interleave, each stack top + ctx.rsp is printed at spawn,
+    // rsp0 is updated on every switch, and every QUANTUM_TICKS-th LAPIC tick
+    // raises a preempt point that the driver observes and logs. Still
+    // cooperative (the driver paces on LAPIC ticks, tasks yield by returning
+    // into the trampoline) — preemptive switch-from-IRQ is a later step.
     serial_println!("sched: phase 3 demo — 3 tasks + napper, own stacks, preempt clock...");
     {
         use crate::task::{RoundRobin, Scheduler, Task};
@@ -329,7 +329,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
             asleep_passes = 0;
             schedules += 1;
-            // Step 2a proof: the handler raised NEED_RESCHED during this
+            // Step 2b proof: the handler raised NEED_RESCHED during this
             // pass — a quantum expired, the policy noticed. Log it loudly.
             if crate::task::take_preempt_flag() {
                 preempts += 1;
@@ -349,7 +349,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 }
             }
         }
-        // Step 2a gate: at least one quantum must have expired mid-demo.
+        // Step 2b gate: at least one quantum must have expired mid-demo.
         // Zero preempt points means the timer→policy path is dead (flag
         // never raised, or never observed) — say so loudly, not silently.
         if preempts == 0 {
@@ -384,8 +384,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    // Polling-only serial: safe even with IF=0.
+    // Polling-only serial: lock-free (fresh Ports, no statics), safe from
+    // any stack — including a task stack mid-switch. Never touches the
+    // scheduler queue (its Box<Task>s may be mid-mutation) or the heap
+    // beyond the formatter's stack buffer.
     serial_println!("PANIC: {}", info);
+    // cli before the halt loop: with IF=1 every LAPIC tick would wake the
+    // hlt just to re-halt (wake-spam at 100 Hz). Dead machine stays dead.
+    x86_64::instructions::interrupts::disable();
     loop {
         x86_64::instructions::hlt();
     }
