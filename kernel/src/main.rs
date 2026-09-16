@@ -237,11 +237,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     serial_println!("sched: phase 3 demo — 3 tasks, round-robin...");
     {
         use crate::task::{RoundRobin, Scheduler, Task};
+        use core::sync::atomic::Ordering;
+        /// Runaway guard: 3 tasks × 5 steps = 15 schedules healthy.
+        /// Anything past 100 is a stuck task (never returns false) —
+        /// halt loudly instead of spinning forever.
+        const SCHED_RUNAWAY_GUARD: u64 = 100;
+        /// Fairness bar: round-robin promises equal slices — every task
+        /// must show exactly this many runs at the ledger.
+        const SCHED_FAIR_RUNS: u64 = 5;
         let mut sched = RoundRobin::new();
-        // Each task prints its own step and quits after 5 runs — the
-        // interleave in the log IS the proof of fair rotation. The counter
-        // lives INSIDE the closure (mut move) — no shared state, no Arc,
-        // each task owns its ledger line.
+        // Each task prints its own step and quits after SCHED_FAIR_RUNS —
+        // the interleave in the log IS the proof of fair rotation. The
+        // counter lives INSIDE the closure (mut move) — no shared state,
+        // no Arc, each task owns its ledger line.
         for name in ["alpha", "beta", "gamma"] {
             let id = sched.next_id();
             let tag = alloc::string::String::from(name);
@@ -249,45 +257,83 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             sched.spawn(Task::new(id, name, move || {
                 n += 1;
                 crate::serial_println!("task {}/{} step {}", id, tag, n);
-                n < 5
+                n < SCHED_FAIR_RUNS
+            }));
+        }
+        // F3: the Sleeping arm needs a live witness — dead code in a kernel
+        // is debt with interest. Task 4 naps until a LAPIC tick, proving
+        // the sleep/wake path works. It wakes, prints once, and finishes —
+        // ledger must show runs==1 for it.
+        {
+            let id = sched.next_id();
+            let wake_at = crate::idt::APIC_TICKS.load(Ordering::Relaxed) + 20;
+            let mut woke = false;
+            crate::serial_println!(
+                "sched: task {}/napper naps until apic tick ~{}",
+                id,
+                wake_at
+            );
+            sched.spawn(Task::sleeping(id, "napper", wake_at, move || {
+                if !woke {
+                    woke = true;
+                    crate::serial_println!("task {}/napper woke at tick", id);
+                }
+                false
             }));
         }
         // Drive the scheduler until every task finishes. Cooperative —
-        // no timer preemption yet, just back-to-back steps. A stuck task
-        // (never returns false) would spin here forever, so the guard
-        // counts schedules: 3 tasks × 5 steps = 15, anything past 100
-        // is a runaway, halt loudly.
+        // no timer preemption yet, just back-to-back steps.
+        //
+        // F2 fix: `schedule_once() == false` with `alive() > 0` means ALL
+        // tasks are sleeping — NOT done. The old code `break`ed straight
+        // to the ledger and screamed "unfair". Now: hlt-wait for the next
+        // LAPIC tick (which wakes sleepers) and retry. `hlt` is safe here
+        // — the LAPIC is unmasked and ticking, unlike the dead-clock trap.
+        // A consecutive-false counter trips the runaway guard if ticks die.
         let mut schedules: u64 = 0;
+        let mut asleep_passes: u64 = 0;
         while sched.alive() > 0 {
             if !sched.schedule_once() {
-                break;
+                asleep_passes += 1;
+                if asleep_passes > SCHED_RUNAWAY_GUARD {
+                    serial_println!("sched FAILED: tasks asleep forever (ticks dead?). Halting.");
+                    loop {
+                        x86_64::instructions::hlt();
+                    }
+                }
+                x86_64::instructions::hlt(); // sleep until the next LAPIC tick
+                continue;
             }
+            asleep_passes = 0;
             schedules += 1;
-            if schedules > 100 {
+            if schedules > SCHED_RUNAWAY_GUARD {
                 serial_println!(
-                    "sched FAILED: runaway (100 schedules, tasks still alive). Halting."
+                    "sched FAILED: runaway ({} schedules, tasks still alive). Halting.",
+                    SCHED_RUNAWAY_GUARD
                 );
                 loop {
                     x86_64::instructions::hlt();
                 }
             }
         }
-        // The ledger: every task must show exactly 5 runs — round-robin
-        // fairness made visible. Unequal counts mean the queue lied.
+        // The ledger: alpha/beta/gamma must show exactly SCHED_FAIR_RUNS
+        // (round-robin fairness made visible — unequal counts mean the
+        // queue lied), napper must show exactly 1 (napped, woke, done).
         let mut fair = true;
         for (id, name, runs) in sched.ledger() {
             serial_println!("sched ledger: task {}/{} runs={}", id, name, runs);
-            if runs != 5 {
+            let want = if name == "napper" { 1 } else { SCHED_FAIR_RUNS };
+            if runs != want {
                 fair = false;
             }
         }
         if !fair {
-            serial_println!("sched FAILED: unfair ledger (not all runs==5). Halting.");
+            serial_println!("sched FAILED: unfair ledger. Halting.");
             loop {
                 x86_64::instructions::hlt();
             }
         }
-        serial_println!("sched: round-robin fair (3 tasks × 5 steps). Phase 3 online. Halting.");
+        serial_println!("sched: round-robin fair (3×5 + napper×1). Phase 3 online. Halting.");
     }
     loop {
         x86_64::instructions::hlt();

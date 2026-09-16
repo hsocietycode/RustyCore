@@ -29,8 +29,8 @@ pub enum TaskState {
     /// Currently executing (exactly one task per CPU is ever here).
     Running,
     /// Asked to be skipped until a later tick (sleep-until).
-    /// Consumed by Step 2's timer integration — parked until then.
-    #[allow(dead_code)]
+    /// Woken by [`Scheduler::schedule_once`] when `APIC_TICKS` reaches
+    /// `until_tick` — the Step-1 demo parks the napper this way.
     Sleeping { until_tick: u64 },
     /// Done — never scheduled again. The scheduler drops it loudly
     /// (a finish line in the log, not a silent vanish).
@@ -70,6 +70,24 @@ impl Task {
         }
     }
 
+    /// Build a task parked asleep until `until_tick` (APIC_TICKS domain).
+    /// The scheduler carries it through the queue untouched until the tick
+    /// arrives — no busy-wait, the caller hlt-sleeps between passes.
+    pub fn sleeping(
+        id: usize,
+        name: &str,
+        until_tick: u64,
+        step: impl FnMut() -> bool + 'static,
+    ) -> Self {
+        Self {
+            id,
+            name: String::from(name),
+            state: TaskState::Sleeping { until_tick },
+            runs: 0,
+            step: alloc::boxed::Box::new(step),
+        }
+    }
+
     /// Run one step. Returns `true` = still ready, `false` = finished.
     /// Increments the run ledger either way — an attempt is an attempt.
     fn run_step(&mut self) -> bool {
@@ -87,16 +105,25 @@ impl Task {
 
 /// The scheduler contract Phase 3 promises.
 ///
-/// `sched-rr` implements this today; `sched-cfs` will implement the SAME
-/// trait tomorrow — main picks by Cargo feature, the demo doesn't care.
-/// One interface, two policies, zero `if feature` in the hot path.
+/// `RoundRobin` implements this today; `sched-cfs` will implement the SAME
+/// trait when it lands — main picks by Cargo feature with a `compile_error`
+/// gate (like the alloc-bump/buddy gate in `memory::init`), so selecting
+/// an unimplemented policy refuses to build instead of silently booting
+/// the wrong scheduler. One interface, two policies, zero `if feature`
+/// in the hot path.
 pub trait Scheduler {
     /// Add a task to the ready set. Ids are assigned by the caller
     /// (main hands out 1, 2, 3...) — the scheduler never invents identity.
     fn spawn(&mut self, task: Task);
 
     /// Run the next ready task once. Returns `false` when nothing is
-    /// ready (all finished or all sleeping) — the caller halts, not spins.
+    /// ready (all finished, or all sleeping — see below) — the caller
+    /// halts or hlt-waits, never spins.
+    ///
+    /// All-sleeping subtlety: sleeping tasks stay QUEUED (they are alive),
+    /// but if a whole pass finds nobody awake, this returns `false` so the
+    /// caller can `hlt` until the next timer tick instead of burning CPU
+    /// re-checking sleepers. The next call retries — sleepers wake by tick.
     fn schedule_once(&mut self) -> bool;
 
     /// How many tasks are still alive (ready + running + sleeping).
@@ -113,6 +140,16 @@ pub trait Scheduler {
 /// The simplest fair policy: whoever has waited longest runs next, every
 /// task gets an equal slice of schedule calls. No priorities, no vruntime
 /// — that sophistication is `sched-cfs`'s chapter, behind this same trait.
+///
+/// Honesty gate (same style as `memory::init`): `sched-cfs` doesn't exist
+/// yet — selecting it (or nothing, or both) refuses to build instead of
+/// silently booting round-robin under a CFS name.
+#[cfg(all(feature = "sched-rr", feature = "sched-cfs"))]
+compile_error!("select exactly one of sched-rr / sched-cfs, not both");
+#[cfg(not(any(feature = "sched-rr", feature = "sched-cfs")))]
+compile_error!("select one of sched-rr / sched-cfs");
+#[cfg(all(feature = "sched-cfs", not(feature = "sched-rr")))]
+compile_error!("sched-cfs is selected but not implemented yet — build with sched-rr");
 pub struct RoundRobin {
     ready: VecDeque<Task>,
     finished_runs: Vec<(usize, String, u64)>,
@@ -151,34 +188,46 @@ impl Scheduler for RoundRobin {
     }
 
     fn schedule_once(&mut self) -> bool {
-        let mut task = match self.ready.pop_front() {
-            Some(t) => t,
-            None => return false,
-        };
-        // Sleeping tasks park until their tick — cooperative, so the check
-        // is here, not in a timer hook. (Nothing sleeps in the Step-1 demo;
-        // the arm exists so Step 2 doesn't reshape the loop.)
-        if let TaskState::Sleeping { until_tick } = task.state {
-            let now = crate::idt::APIC_TICKS.load(core::sync::atomic::Ordering::Relaxed);
-            if now < until_tick {
-                self.ready.push_back(task);
-                return true;
+        // F1 fix: the old code pushed a still-sleeping task back and
+        // returned `true` — with ALL tasks asleep, the caller spun forever
+        // (`alive() > 0` forever, `schedule_once` never false). Now: one
+        // full pass over the queue; if nobody was awake, return `false`
+        // so the caller hlt-waits for the next tick instead of burning CPU.
+        let len = self.ready.len();
+        if len == 0 {
+            return false;
+        }
+        for _ in 0..len {
+            let mut task = match self.ready.pop_front() {
+                Some(t) => t,
+                None => return false,
+            };
+            // Sleeping tasks park until their tick — cooperative, so the
+            // check is here, not in a timer hook.
+            if let TaskState::Sleeping { until_tick } = task.state {
+                let now = crate::idt::APIC_TICKS.load(core::sync::atomic::Ordering::Relaxed);
+                if now < until_tick {
+                    self.ready.push_back(task);
+                    continue;
+                }
+                task.state = TaskState::Ready;
             }
-            task.state = TaskState::Ready;
+            let alive = task.run_step();
+            if alive {
+                self.ready.push_back(task);
+            } else {
+                crate::serial_println!(
+                    "sched: task {}/{} finished after {} runs",
+                    task.id,
+                    task.name,
+                    task.runs
+                );
+                self.finished_runs.push((task.id, task.name, task.runs));
+            }
+            return true;
         }
-        let alive = task.run_step();
-        if alive {
-            self.ready.push_back(task);
-        } else {
-            crate::serial_println!(
-                "sched: task {}/{} finished after {} runs",
-                task.id,
-                task.name,
-                task.runs
-            );
-            self.finished_runs.push((task.id, task.name, task.runs));
-        }
-        true
+        // Whole pass, nobody awake — all sleeping. Caller hlt-waits.
+        false
     }
 
     fn alive(&self) -> usize {
