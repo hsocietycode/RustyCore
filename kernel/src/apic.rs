@@ -1,10 +1,11 @@
-//! APIC bring-up: probe → map → enable → calibrate (Steps 1–4).
+//! APIC bring-up: probe → map → enable → calibrate → soak → promote.
 //!
 //! Step 1 is read-only detection (CPUID + IA32_APIC_BASE MSR). Step 3 maps
 //! the LAPIC MMIO page into [`crate::memory::MMIO_WINDOW`] and enables via
 //! SVR (LVT timer stays masked — PIC+PIT remains the one true clock until
-//! Step 5). Step 4 calibrates the LAPIC timer against the PIT ruler.
-//! Nothing here fires LAPIC interrupts yet — that is Step 5.
+//! Step 7). Step 4 calibrates the LAPIC timer against the PIT ruler
+//! (three windows, median wins). Step 5 runs the periodic dual-clock soak.
+//! Step 7 promotes the LAPIC to master clock with PIC-rollback on failure.
 
 use bootloader_api::BootInfo;
 use x86_64::{
@@ -189,6 +190,12 @@ pub fn ticks_per_10ms() -> u64 {
 const PIT_HZ: u32 = 100;
 const CALIB_PIT_TICKS: u32 = 10;
 
+/// Calibration rounds for [`calibrate`]: three windows, median wins.
+/// PIT IRQ jitter (±1 tick on each edge) shifts single-window deltas by
+/// ~1–2%; the median of three shrugs it off. Three rounds cost ~300 ms of
+/// boot — cheap against a clock that lies for the rest of uptime.
+const CALIB_ROUNDS: usize = 3;
+
 /// Pure tick math for [`calibrate`]: APIC ticks elapsed during `pit_ticks`
 /// PIT ticks at `pit_hz`, scaled to a 10 ms window. Saturating + div0-guarded
 /// so garbage inputs yield 0 (Step 5 treats 0 as "calibration failed",
@@ -207,19 +214,25 @@ pub fn calibrate_ticks(delta: u32, pit_hz: u32, pit_ticks: u32) -> u64 {
         .unwrap_or(0)
 }
 
-/// Calibrate the LAPIC timer against the PIT ruler (Step 4).
+/// Calibrate the LAPIC timer against the PIT ruler (Step 4, refined Step 7).
 ///
 /// One-shot, no LAPIC IRQs: DCR = divide-by-16, ICR = 0xFFFFFFFF, then
-/// burn ~100 ms of CPU waiting for `TIMER_TICKS` to advance
-/// `CALIB_PIT_TICKS` PIT ticks, and read CCR./// Requires IF=1 — the PIT ruler advances via IRQ0, and with IF=0 no ticks
+/// burn ~100 ms of CPU per round waiting for `TIMER_TICKS` to advance
+/// `CALIB_PIT_TICKS` PIT ticks, and read CCR.
+///
+/// Three rounds, median wins: PIT IRQ jitter (±1 tick on window edges)
+/// skews single-window runs by ~1–2% — that skew IS the ~11-tick drift we
+/// watched all through Step 5 (`pic=100 apic=~89`). The median of three
+/// shrugs the jitter off and programs a quantum both clocks agree on.
+/// Requires IF=1 — the PIT ruler advances via IRQ0, and with IF=0 no ticks
 /// ever arrive. Busy-wait (not `hlt`) deliberately: if the PIT itself is
 /// dead, `hlt` would sleep forever past the spin-out guard below, while a
 /// busy loop trips the guard in seconds and reports it. Main enables
 /// interrupts before calling.
 ///
-/// Stores `ticks_per_10ms`; prints the delta for the log. A zero delta
-/// (MMIO cached? DCR/ICR write lost?) is a loud `Err`, not a silent zero
-/// rate — Step 5 must never divide by it.
+/// Stores `ticks_per_10ms`; prints all three deltas plus the median for the
+/// log. A zero median (MMIO cached? DCR/ICR writes lost?) is a loud `Err`,
+/// not a silent zero rate — Step 5 must never divide by it.
 ///
 /// Call after [`init`] (window mapped) and `timer::init` (PIT ticking) —
 /// only the PIT counter is read, no LAPIC IRQ involved.
@@ -234,44 +247,64 @@ pub fn calibrate() -> Result<u64, &'static str> {
         // Divide-by-16: DCR bits 0,1,3 = 0b1011. One-shot mode: LVT masked
         // already (Step 3), so the counter just runs down without firing.
         core::ptr::write_volatile(reg(DCR_OFFSET)?, 0x3);
-        core::ptr::write_volatile(reg(ICR_OFFSET)?, 0xFFFF_FFFF);
 
-        let start = crate::idt::TIMER_TICKS.load(Ordering::Relaxed);
-        // ~100 ms of PIT, then a spin-out guard: 10M busy iterations is
-        // ~a second of wall time on QEMU TCG — if the PIT is dead we say so
-        // instead of hanging. (Was 100M: minutes of wall time on weak CI
-        // before the error surfaced. The PIT path exits in microseconds
-        // when healthy, so a tight guard costs nothing on the happy path.)
-        // Busy `spin_loop` ON PURPOSE here, not `hlt`: with a
-        // dead PIT no IRQ ever arrives, so `hlt` would sleep forever and
-        // the guard below would never run. Burning ~100 ms of CPU once
-        // per boot is the price of a guard that actually guards.
-        let mut spins: u64 = 0;
-        loop {
-            if crate::idt::TIMER_TICKS
-                .load(Ordering::Relaxed)
-                .wrapping_sub(start)
-                >= CALIB_PIT_TICKS as u64
-            {
-                break;
+        let mut deltas = [0u32; CALIB_ROUNDS];
+        for slot in deltas.iter_mut() {
+            // Fresh full counter every round — each window stands alone.
+            core::ptr::write_volatile(reg(ICR_OFFSET)?, 0xFFFF_FFFF);
+
+            let start = crate::idt::TIMER_TICKS.load(Ordering::Relaxed);
+            // ~100 ms of PIT, then a spin-out guard: 10M busy iterations is
+            // ~a second of wall time on QEMU TCG — if the PIT is dead we say
+            // so instead of hanging. (Was 100M: minutes of wall time on weak
+            // CI before the error surfaced. The PIT path exits in
+            // microseconds when healthy, so a tight guard costs nothing on
+            // the happy path.)
+            // Busy `spin_loop` ON PURPOSE here, not `hlt`: with a
+            // dead PIT no IRQ ever arrives, so `hlt` would sleep forever and
+            // the guard below would never run. Burning ~100 ms of CPU per
+            // round is the price of a guard that actually guards.
+            let mut spins: u64 = 0;
+            loop {
+                if crate::idt::TIMER_TICKS
+                    .load(Ordering::Relaxed)
+                    .wrapping_sub(start)
+                    >= CALIB_PIT_TICKS as u64
+                {
+                    break;
+                }
+                spins += 1;
+                if spins > 10_000_000 {
+                    return Err("apic: PIT produced no ticks during calibration — timer dead?");
+                }
+                core::hint::spin_loop();
             }
-            spins += 1;
-            if spins > 10_000_000 {
-                return Err("apic: PIT produced no ticks during calibration — timer dead?");
+
+            let cur = core::ptr::read_volatile(reg(CCR_OFFSET)? as *const u32);
+            let delta = 0xFFFF_FFFFu32.wrapping_sub(cur);
+            if delta == 0 {
+                return Err("apic: CCR delta is zero — MMIO writes lost (NO_CACHE missing?)");
             }
-            core::hint::spin_loop();
+            *slot = delta;
         }
 
-        let cur = core::ptr::read_volatile(reg(CCR_OFFSET)? as *const u32);
-        let delta = 0xFFFF_FFFFu32.wrapping_sub(cur);
-        if delta == 0 {
-            return Err("apic: CCR delta is zero — MMIO writes lost (NO_CACHE missing?)");
+        // Median of three by hand — no sorting dependency in the kernel.
+        // min-max dance: max(min(a,b), min(max(a,b),c)) is the middle value.
+        let (a, b, c) = (deltas[0], deltas[1], deltas[2]);
+        let median = a.min(b).max(c.min(a.max(b)));
+        let spread = a.max(b).max(c) - a.min(b).min(c);
+        let per_10ms = calibrate_ticks(median, PIT_HZ, CALIB_PIT_TICKS);
+        if per_10ms == 0 {
+            return Err("apic: calibrated rate is zero — refusing to program it");
         }
-        let per_10ms = calibrate_ticks(delta, PIT_HZ, CALIB_PIT_TICKS);
         TICKS_PER_10MS.store(per_10ms, Ordering::Relaxed);
         crate::serial_println!(
-            "apic-timer: calibrate ccr_delta={} (~{} ticks/ms)",
-            delta,
+            "apic-timer: calibrate rounds=[{} {} {}] median={} spread={} (~{} ticks/ms)",
+            deltas[0],
+            deltas[1],
+            deltas[2],
+            median,
+            spread,
             per_10ms / 10
         );
         Ok(per_10ms)
@@ -340,4 +373,54 @@ pub fn eoi() -> Result<(), &'static str> {
         core::ptr::write_volatile(eoi, 0);
     }
     Ok(())
+}
+
+/// Promote the LAPIC timer to master clock (Step 7).
+///
+/// Gates: the soak in main must have proven both clocks (`pic >= 100 &&
+/// apic >= 100`) before this is called — promoting on an unproven APIC
+/// would trade a working PIT for a silent box. This function trusts the
+/// caller on the gate (it cannot see the counters' history) and enforces
+/// the part it CAN see: window mapped, rate non-zero.
+///
+/// What it does: masks IRQ0 on the PIC (IRQ1 keyboard stays — the LAPIC
+/// knows nothing of keystrokes), keeps the LAPIC periodic rate untouched,
+/// and returns. From here 0xEF is the one true tick; IRQ0 is silent.
+///
+/// Rollback lives in the caller (main): if the LAPIC stalls post-promotion,
+/// `crate::interrupts::PICS.lock().write_masks(0xFC, 0xFF)` unmasks IRQ0
+/// and the PIT carries the kernel again. Promotion without a rollback plan
+/// is a leap, not engineering.
+pub fn promote() -> Result<(), &'static str> {
+    use core::sync::atomic::Ordering;
+    if LAPIC_VIRT.load(Ordering::Relaxed) == 0 {
+        return Err("apic: promote before init — LAPIC window not mapped");
+    }
+    if ticks_per_10ms() == 0 {
+        return Err("apic: promote without a calibrated rate — refusing");
+    }
+    unsafe {
+        // Mask IRQ0 (timer) on the master PIC, keep IRQ1 (keyboard):
+        // old master mask & 0x01-set... simplest honest shape is to ask
+        // the PIC for its current masks and set bit 0 of the master.
+        let mut pics = crate::interrupts::PICS.lock();
+        let masks = pics.read_masks();
+        pics.write_masks(masks[0] | 0x01, masks[1]);
+    }
+    crate::serial_println!("apic-timer: promoted to master clock (PIC IRQ0 masked, IRQ1 kept)");
+    Ok(())
+}
+
+/// Roll back to the PIT: unmask IRQ0 on the PIC.
+///
+/// The inverse of [`promote`]: master mask bit 0 → 0 (IRQ1 and everything
+/// else untouched). Called when the post-promotion watch sees the LAPIC
+/// stall — the PIT, never disabled, resumes ticking immediately.
+pub fn rollback_to_pit() {
+    unsafe {
+        let mut pics = crate::interrupts::PICS.lock();
+        let masks = pics.read_masks();
+        pics.write_masks(masks[0] & !0x01, masks[1]);
+    }
+    crate::serial_println!("apic-timer: ROLLED BACK to PIT (IRQ0 unmasked)");
 }

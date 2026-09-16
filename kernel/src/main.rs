@@ -100,6 +100,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let mut last_pic: u64 = 0;
     let mut last_apic: u64 = 0;
     loop {
+        use crate::idt::SOAK_TICKS_EACH;
         use core::sync::atomic::Ordering;
         let pic = idt::TIMER_TICKS.load(Ordering::Relaxed);
         let apic_ticks = idt::APIC_TICKS.load(Ordering::Relaxed);
@@ -111,18 +112,18 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             last_apic = apic_ticks;
             serial_println!("tick: pic={} apic=~{}", pic, apic_ticks);
         }
-        if pic >= 100 && apic_ticks >= 100 {
+        if pic >= SOAK_TICKS_EACH && apic_ticks >= SOAK_TICKS_EACH {
             break;
         }
-        // APIC silent but PIC alive at 100? Loud fallback, PIT carries on.
-        if pic >= 100 && apic_ticks == 0 {
+        // APIC silent but PIC alive at the gate? Loud fallback, PIT carries on.
+        if pic >= SOAK_TICKS_EACH && apic_ticks == 0 {
             serial_println!("apic-timer: NO IRQs (PIC ok, continuing)");
             break;
         }
-        // APIC whispering but lapped twice by the PIC without reaching 100?
+        // APIC whispering but lapped twice by the PIC without reaching gate?
         // Degraded, not dead — report with counts, continue on the PIT.
-        // (apic==0 already broke above, so this arm is strictly 0<apic<100.)
-        if pic >= 200 && apic_ticks < 100 {
+        // (apic==0 already broke above, so this arm is strictly 0<apic<gate.)
+        if pic >= SOAK_TICKS_EACH * 2 && apic_ticks < SOAK_TICKS_EACH {
             serial_println!(
                 "apic-timer: DEGRADED (pic={} apic=~{} after ~2s, PIC ok, continuing)",
                 pic,
@@ -152,9 +153,78 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     }
 
     serial_println!(
-        "self-test: dual-clock soak done, both clocks live (spurious={}). Phase 2 online. Halting.",
+        "self-test: dual-clock soak done (spurious={}).",
         idt::SPURIOUS_HITS.load(core::sync::atomic::Ordering::Relaxed)
     );
+
+    // Step 7: promotion. The soak above is the gate — we only get here
+    // with BOTH clocks proven, or via the loud PIC-only fallback. Promote
+    // only on proven dual-life: if the APIC leg never reached the gate,
+    // promoting trades a working PIT for a silent box. Check the counters,
+    // not our hopes.
+    {
+        use crate::idt::SOAK_TICKS_EACH;
+        use core::sync::atomic::Ordering;
+        let pic = idt::TIMER_TICKS.load(Ordering::Relaxed);
+        let apic_ticks = idt::APIC_TICKS.load(Ordering::Relaxed);
+        if pic < SOAK_TICKS_EACH || apic_ticks < SOAK_TICKS_EACH {
+            serial_println!(
+                "apic-timer: promotion SKIPPED (pic={} apic=~{} — soak did not prove dual-life). PIT stays master. Phase 2 online. Halting.",
+                pic,
+                apic_ticks
+            );
+            loop {
+                x86_64::instructions::hlt();
+            }
+        }
+    }
+
+    apic::promote().expect("apic promote failed");
+
+    // Post-promotion watch: ~1s of LAPIC-only ticks. PIC IRQ0 is masked,
+    // so TIMER_TICKS must freeze while APIC_TICKS climbs by a full gate.
+    // If the LAPIC stalls (no +20 in 1B spins), roll back to the PIT
+    // loudly — a promotion without a rollback plan is a leap, not
+    // engineering.
+    serial_println!("self-test: promotion watch (LAPIC-only, ~1s)...");
+    {
+        use crate::idt::SOAK_TICKS_EACH;
+        use core::sync::atomic::Ordering;
+        let apic_base = idt::APIC_TICKS.load(Ordering::Relaxed);
+        let mut spins: u64 = 0;
+        let mut last_apic: u64 = apic_base;
+        loop {
+            let apic_ticks = idt::APIC_TICKS.load(Ordering::Relaxed);
+            if apic_ticks >= last_apic + 20 {
+                last_apic = apic_ticks;
+                serial_println!(
+                    "promoted tick: apic=~{} (+{})",
+                    apic_ticks,
+                    apic_ticks - apic_base
+                );
+            }
+            if apic_ticks - apic_base >= SOAK_TICKS_EACH {
+                let pic_now = idt::TIMER_TICKS.load(Ordering::Relaxed);
+                serial_println!(
+                    "self-test: LAPIC master proven (apic +{} like the gate, pic frozen at {}). Phase 2 online. Halting.",
+                    apic_ticks - apic_base,
+                    pic_now
+                );
+                break;
+            }
+            spins += 1;
+            if spins > 1_000_000_000 {
+                serial_println!(
+                    "self-test: LAPIC STALLED post-promotion (apic +{} in guard window) — rolling back to PIT.",
+                    apic_ticks - apic_base
+                );
+                apic::rollback_to_pit();
+                serial_println!("self-test: PIT master again. Phase 2 online (degraded). Halting.");
+                break;
+            }
+            core::hint::spin_loop();
+        }
+    }
     loop {
         x86_64::instructions::hlt();
     }

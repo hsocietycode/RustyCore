@@ -39,6 +39,11 @@ pub static APIC_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::Atomi
 /// `int 0x80` hits since boot. Kernel-only stub for now (Ring0, no STAR/LSTAR).
 pub static SYSCALL_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Soak/promotion thresholds: how many ticks on EACH clock prove dual-life
+/// (Step 5 gate) and LAPIC mastery (Step 7 watch). Single source of truth —
+/// main reads these, never magic 100s.
+pub const SOAK_TICKS_EACH: u64 = 100;
+
 /// Spurious IRQ hits since boot (0xFF APIC + PIC phantom IRQ7/IRQ15).
 /// Expected noise, not faults — but counted, so silence-vs-noise is visible.
 pub static SPURIOUS_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
