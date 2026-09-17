@@ -1,27 +1,40 @@
 # RustyCore
 
-Minimal `no_std` x86_64 kernel in Rust. 64-bit only, BIOS boot (UEFI lands in
-Phase 1), customizable via Cargo features + `config/kernel_config.toml`.
+Minimal `no_std` x86_64 kernel in Rust. 64-bit only, BIOS boot first (UEFI is
+on the roadmap), customizable via Cargo features + `config/kernel_config.toml`.
 
 Org: https://github.com/hsocietycode
 
 ## Status
 
-Boots in QEMU today:
+Boots in QEMU today. Phase 1 (memory), Phase 2 (interrupts) and Phase 3
+(processes) are done — the kernel owns a buddy frame allocator, a heap, a live
+LAPIC, a Round-Robin/CFS scheduler behind one trait, real per-task stacks, and
+a `#[unsafe(naked)]` LAPIC-timer stub that preempts a running task mid-step.
+
+Tail of a real boot (abridged):
 
 ```
 RustyCore v0.2 - serial online.
 RustyCore v0.2 - GDT+TSS loaded (double-fault IST ready).
 RustyCore v0.2 - IDT loaded (exceptions + IRQ vectors live).
 RustyCore v0.2 - PIC remapped to 32..=47, all masked.
-memory: 248 MiB usable in 3 regions, heap 1024 KiB at 0xffff900000000000, phys offset 0xffff800000000000
-memory: heap self-test ok (len=66, sum=0xc107da)
-timer: PIT @ ~100 Hz, IRQ0 unmasked
-self-test: firing int3 breakpoint...
-self-test: breakpoint handler returned, IDT works.
-self-test: enabling interrupts, waiting for 100 timer ticks...
-self-test: 100 timer ticks seen, IRQs work. Phase 2 online. Halting.
+apic: probe present=true base=0xfee00000 enabled=true bsp=true rsdp=yes; base=msr
+memory: 504 MiB usable in 3 regions, heap 1024 KiB at 0xffff900000000000, phys offset 0xffff800000000000 (frames: buddy)
+memory: buddy self-test ok (free 128846 frames, alloc+free round-trips, allocated=259)
+apic: mapped + enabled id=0 ver=0x50014 svr=0x1ff
+apic-timer: calibrate rounds=[6205998 6243191 6253336] median=6243191
+apic-timer: promoted to master clock (PIC IRQ0 masked, IRQ1 kept)
+self-test: LAPIC master proven (apic +100 like the gate, pic frozen at 132).
+preempt: fence=down eoi-base=0xffffa000000000b0 stub=0x1000000dc24 switches=0 (proof block ok)
+sched: task 1/alpha stack top 0xffff900000020320 (128 KiB) ctx.rsp=... preempt rip=... slot=0
+sched: preempt yank 1 (switches 0->1) at apic tick ~...
+sched ledger: task 1/alpha runs=5
+sched: round-robin fair (3x5 + napperx1). Phase 3 online. Halting.
 ```
+
+Per-phase status lives in [`docs/ROADMAP.md`](docs/ROADMAP.md); the log above
+is the gate CI greps for (`Phase [23] online`).
 
 ## Prereqs
 
@@ -56,13 +69,17 @@ Cargo.toml           # workspace + release profile (opt3, LTO fat)
 rust-toolchain.toml  # nightly + rust-src
 .cargo/config.toml   # x86-64-v2 rustflags, `cargo xtask` alias
 config/kernel_config.toml
-kernel/              # no_std kernel (bootloader_api entry, serial, PIC, GDT/IDT, PIT)
-  src/main.rs        # entry: GDT+TSS → IDT → PIC → memory → PIT → self-tests → IF=1
+kernel/              # no_std kernel (bootloader_api entry, serial, PIC/APIC, GDT/IDT, PIT, alloc, sched)
+  src/main.rs        # entry: GDT+TSS → IDT → PIC → APIC probe → memory → PIT → self-tests → sched demo
   src/serial.rs      # COM1 polling driver (IER=0 — no UART IRQs before IDT)
-  src/interrupts.rs  # 8259 remap to 32..47, all masked for now
+  src/interrupts.rs  # 8259 remap to 32..47
   src/gdt.rs         # GDT + TSS with double-fault IST escape stack
-  src/idt.rs         # exception handlers (breakpoint, DF/IST, PF, GP…) + IRQ0/IRQ1
+  src/idt.rs         # exception handlers (breakpoint, DF/IST, PF, GP…) + IRQ vectors
+  src/apic.rs        # LAPIC probe/map/enable/calibrate/soak/promote (+ EOI)
   src/timer.rs       # PIT channel 0 @ ~100 Hz, unmasks IRQ0
+  src/memory/*.rs    # bump + buddy frame allocators, heap, MMIO window mapping
+  src/task.rs        # Task/TaskStack, naked context switch, RR + CFS schedulers
+  src/preempt.rs     # naked LAPIC-timer stub: full-frame preemption from IRQ
 xtask/               # host tools: build, image (BIOS), run-qemu
 docs/                # ROADMAP, design notes
 ```

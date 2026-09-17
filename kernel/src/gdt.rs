@@ -20,25 +20,51 @@ use x86_64::{
 /// IST index used by the double-fault handler (0-based software index).
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
-lazy_static! {
-    static ref TSS: TaskStateSegment = {
-        let mut tss = TaskStateSegment::new();
-        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
-            const STACK_SIZE: usize = 4096 * 5;
-            static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
-            let stack_start = VirtAddr::from_ptr(&raw const STACK);
-            stack_start + STACK_SIZE as u64
-        };
-        tss
-    };
+/// Double-fault IST stack: 5 pages, static (no heap at the time it is used —
+/// a double fault can fire before memory init, so this must not depend on
+/// the allocator).
+const DF_STACK_SIZE: usize = 4096 * 5;
+static mut DF_STACK: [u8; DF_STACK_SIZE] = [0; DF_STACK_SIZE];
+
+/// The one TSS. `static mut` + `TSS::new()` (a `const fn`) — no `lazy_static`
+/// and, crucially, no `&raw mut` derived from a SHARED reference: writing
+/// `privilege_stack_table[0]` through a pointer laundered from `&TSS` would
+/// be UB (a shared reference promises immutability). Every access goes
+/// through an explicit raw pointer to this static instead.
+///
+/// `unsafe` reads are concentrated in the two big `unsafe` blocks below, both
+/// of which own their access completely (single CPU; the only writer of
+/// `rsp0` is the scheduler, which runs with IF=0).
+static mut TSS: TaskStateSegment = TaskStateSegment::new();
+
+/// Initialize the TSS fields that need addresses (the double-fault IST slot).
+/// Must run before [`init`] builds the GDT descriptor for the TSS — the
+/// descriptor copies the base/limit, so a later write to the structure is
+/// still visible, but the IST pointer must be non-zero before a fault can
+/// vector through `DOUBLE_FAULT_IST_INDEX`.
+fn init_tss_fields() {
+    // SAFETY: single writer, before the IDT is loaded (so no fault can run
+    // concurrently), and `DF_STACK` is a static the kernel owns exclusively.
+    unsafe {
+        let tss = &raw mut TSS;
+        let stack_start = VirtAddr::from_ptr(&raw const DF_STACK);
+        (*tss).interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
+            stack_start + DF_STACK_SIZE as u64;
+    }
 }
 
 lazy_static! {
     static ref GDT: (GlobalDescriptorTable, Selectors) = {
+        init_tss_fields();
         let mut gdt = GlobalDescriptorTable::new();
         let code_selector = gdt.append(Descriptor::kernel_code_segment());
         let data_selector = gdt.append(Descriptor::kernel_data_segment());
-        let tss_selector = gdt.append(Descriptor::tss_segment(&TSS));
+        // SAFETY: `TSS` is a live static; the descriptor only records its
+        // address and length, so it stays valid for the whole boot. The
+        // reference is transient (the descriptor is returned by value) and
+        // read-only — the raw pointer keeps us off `&TSS` (static-mut-refs).
+        let tss_ptr: *const TaskStateSegment = &raw const TSS;
+        let tss_selector = gdt.append(unsafe { Descriptor::tss_segment(&*tss_ptr) });
         (
             gdt,
             Selectors {
@@ -70,13 +96,18 @@ struct Selectors {
 /// disabled around the call) — no concurrent reader can observe a half
 /// write on a 64-bit aligned store.
 pub fn set_rsp0(top: u64) {
+    // SAFETY: single writer (the scheduler, IF=0), 64-bit aligned store, no
+    // aliasing reader. Raw pointer straight to the static — no shared
+    // reference is ever formed, so this is sound.
     unsafe {
-        // `&raw mut` through the lazy_static — the TSS lives for the whole
-        // boot, and this is the only writer (no aliasing reader exists).
-        let tss_ptr = &raw mut *(&raw const *TSS as *mut TaskStateSegment);
-        (*tss_ptr).privilege_stack_table[0] = VirtAddr::new(top);
+        let tss = &raw mut TSS;
+        (*tss).privilege_stack_table[0] = VirtAddr::new(top);
     }
-    crate::serial_println!("gdt: rsp0 -> {:#x}", top);
+    // Deliberately NO serial print here: this runs on every task switch, and
+    // one line per switch drowns the scheduler log (16 lines for a 16-switch
+    // demo). The proof of the path is the value itself; when ring 3 lands and
+    // hardware starts reading rsp0, a wrong value surfaces as a fault on the
+    // first syscall — a much better witness than a log line nobody reads.
 }
 
 /// Load the GDT, reload segment registers, and load the TSS.

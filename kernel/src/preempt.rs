@@ -79,16 +79,14 @@ pub struct FullFrame {
     pub magic: u64,
 }
 
-/// Words in the SW spill (15 GPRs) — the stub and the math share this.
-const SPILL_WORDS: usize = 15;
-/// Words the CPU pushes on a ring-0 IRQ (rip/cs/rflags — no rsp/ss, no code).
-const HW_WORDS: usize = 3;
-
-/// Layout lock: the stub spills exactly [`SPILL_WORDS`] GPRs, then the frame
-/// carries pre-IRQ rsp + 3 HW words + magic. If anyone adds a field, this
-/// assert screams at compile time — the stub's offsets would silently lie.
+/// Layout lock: the stub spills exactly [`SPILL_WORDS`] GPRs, copies the
+/// 3 hardware words, computes the pre-IRQ rsp, and stamps the magic. All of
+/// that must fit the struct, and the struct must be exactly one
+/// [`FRAME_STRIDE`] long — the stub indexes `TASK_FRAMES` by stride, so a
+/// mismatch would send frames to overlapping slots. If anyone adds a field,
+/// this assert screams at compile time instead of the stub lying silently.
 const _: () = assert!(
-    core::mem::size_of::<FullFrame>() == (SPILL_WORDS + 1 + HW_WORDS + 1) * 8,
+    core::mem::size_of::<FullFrame>() == (SPILL_WORDS + DOWN_WORDS + HW_WORDS) * 8,
     "FullFrame layout drifted from the stub's spill math"
 );
 
@@ -185,6 +183,20 @@ pub static PREEMPTIBLE: AtomicU8 = AtomicU8::new(0);
 /// worth a dynamic allocator in IRQ context).
 pub const MAX_TASKS: usize = 8;
 
+/// Words in the SW spill (15 GPRs) — the stub and the layout assert share this.
+const SPILL_WORDS: usize = 15;
+/// Words the CPU pushes on a ring-0 IRQ (rip/cs/rflags — no rsp/ss, no code).
+const HW_WORDS: usize = 3;
+/// Words the stub writes below the spill: pre-IRQ rsp + magic. NOT part of
+/// `FullFrame` (the frame struct starts at the r15 slot), but they occupy
+/// stack space the layout assert must account for.
+const DOWN_WORDS: usize = 2;
+
+/// Byte offset of one frame inside [`TASK_FRAMES`]. Derived from the type —
+/// the stub's `imul rax, rax, 0xa0` is guarded by the assert below, so a
+/// struct change can never silently desync the indexing.
+const FRAME_STRIDE: u64 = core::mem::size_of::<FullFrame>() as u64;
+
 /// Static task table: the IRQ-visible scheduling state. Fixed slots, indexed
 /// by `CURRENT_IDX` — no `Box`, no `Vec`, no alloc, no move in IRQ context.
 /// The driver fills a slot at spawn (IF=0); the stub only reads/writes bytes
@@ -202,11 +214,12 @@ pub static PREEMPT_SWITCHES: core::sync::atomic::AtomicU64 = core::sync::atomic:
 /// no lock — single CPU, IF=0 through the stub.
 pub static CURRENT_IDX: AtomicU8 = AtomicU8::new(MAX_TASKS as u8);
 
-/// How many live task slots the driver has registered (spawned but not yet
-/// reaped). The stub's pick-next advances `CURRENT_IDX` modulo this count,
-/// skipping nothing — every live slot is runnable (the driver parks sleepers
-/// by NOT switching into them, not by marking a slot dead).
-pub static ALIVE_COUNT: AtomicU8 = AtomicU8::new(0);
+/// Slot occupancy bitmap: bit `i` set ⇔ `TASK_FRAMES[i]` holds a live task.
+/// A bitmap (not a count) because slots are released individually when a task
+/// finishes — a finish order of 1,3,2 leaves holes, and "index < count" would
+/// happily accept a freed slot. `u8` covers [`MAX_TASKS`] = 8 exactly; the
+/// stub tests the bit with a single `bt`, no lock (single CPU, IF=0).
+pub static SLOT_USED: AtomicU8 = AtomicU8::new(0);
 
 /// Flip the fence. Called by the trampoline only (IF=0 at both flip points —
 /// see the race note on [`PREEMPTIBLE`]: the set flip happens right after
@@ -216,18 +229,43 @@ pub fn set_preemptible(on: bool) {
 }
 
 /// Register a task's preempt frame in the static table at index `idx`. Called
-/// by the driver at spawn with IF=0 (no task running yet) — a plain memcpy,
-/// no lock. Bumps `ALIVE_COUNT` once the frame is live. The slot's `FullFrame`
-/// (magic, rsp=stack top, rip=trampoline) is what the FIRST `iretq` resumes.
+/// by the driver at spawn with IF=0 (no task running yet) — a plain store,
+/// no lock. Sets the occupancy bit so the stub will accept the slot. The
+/// frame's `rip` is the trampoline; the first yank overwrites it with the
+/// exact interrupted state.
 pub fn register_task(idx: usize, frame: FullFrame) {
     assert!(idx < MAX_TASKS, "preempt: task slot overflow");
+    assert!(
+        SLOT_USED.load(Ordering::Relaxed) & (1 << idx) == 0,
+        "preempt: slot {idx} registered twice — slot accounting is broken"
+    );
     unsafe {
         core::ptr::addr_of_mut!(TASK_FRAMES)
             .cast::<FullFrame>()
             .add(idx)
             .write(frame);
     }
-    ALIVE_COUNT.fetch_add(1, Ordering::Relaxed);
+    SLOT_USED.fetch_or(1 << idx, Ordering::Relaxed);
+}
+
+/// Release a task's slot when it finishes. Clears the occupancy bit and
+/// wipes the frame back to its invalid template (magic 0) so a late stray
+/// yank — or a `snapshot` of a retired slot — sees "unregistered", never a
+/// stale rip pointing at a freed stack. Called by the scheduler after the
+/// task's final switch, with the fence down.
+pub fn unregister_task(idx: usize) {
+    assert!(idx < MAX_TASKS, "preempt: task slot overflow on release");
+    assert!(
+        SLOT_USED.load(Ordering::Relaxed) & (1 << idx) != 0,
+        "preempt: releasing slot {idx} that was never registered"
+    );
+    unsafe {
+        core::ptr::addr_of_mut!(TASK_FRAMES)
+            .cast::<FullFrame>()
+            .add(idx)
+            .write(FullFrame::ZERO);
+    }
+    SLOT_USED.fetch_and(!(1 << idx), Ordering::Relaxed);
 }
 
 /// Publish the running-task index. Called by the driver right before it
@@ -291,15 +329,22 @@ pub unsafe extern "C" fn lapic_preempt_stub() {
         // Fence down means boot/driver stack: skip the task-table stash.
         "cmp BYTE PTR [rip + {fence}], 0",
         "je 2f",
-        // Refuse a corrupt/sentinel index before touching TASK_FRAMES.
+        // Refuse a corrupt/sentinel index BEFORE touching TASK_FRAMES — and
+        // refuse a slot nobody owns: the occupancy bitmap is the truth, so a
+        // freed-or-never-registered slot can never receive a yank (its frame
+        // is the invalid template, magic 0).
         "movzx eax, BYTE PTR [rip + {cur_idx}]",
         "cmp eax, {max_tasks}",
         "jae 2f",
-        // Count this real yank (fence up + valid current task index).
+        "movzx ecx, BYTE PTR [rip + {slot_used}]",
+        "bt ecx, eax",
+        "jnc 2f",
+        // Count this real yank (fence up + registered current task index).
         "lock inc qword ptr [rip + {switches}]",
         // --- 2. STASH FullFrame into TASK_FRAMES[index]. ---
-        // FullFrame is 20 u64 = 160 (0xA0) bytes, locked by const assert.
-        "imul rax, rax, 0xa0",
+        // Stride is `FRAME_STRIDE` (checked against size_of::<FullFrame>() by
+        // a const assert — the two can never drift).
+        "imul rax, rax, {stride}",
         "lea rdi, [rip + {frames}]",
         "add rdi, rax",
         // Stack spill is reverse of FullFrame fields: [rsp]=rax ..
@@ -338,10 +383,12 @@ pub unsafe extern "C" fn lapic_preempt_stub() {
         "iretq",
         fence = sym PREEMPTIBLE,
         cur_idx = sym CURRENT_IDX,
+        slot_used = sym SLOT_USED,
         frames = sym TASK_FRAMES,
         eoi_base = sym EOI_BASE,
         magic_const = const PREEMPT_MAGIC,
         max_tasks = const MAX_TASKS,
+        stride = const FRAME_STRIDE,
         apic_ticks = sym crate::idt::APIC_TICKS,
         switches = sym PREEMPT_SWITCHES,
     )

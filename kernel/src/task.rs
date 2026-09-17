@@ -155,36 +155,49 @@ pub unsafe extern "C" fn context_switch(old: *mut Context, new: *const Context) 
 
 /// Build the fake first frame on a fresh task stack.
 ///
-/// Layout at `top` (16-byte aligned, stacks grow down), 7 slots = 56 bytes:
+/// Layout at `top` (16-byte aligned, stacks grow down), 7 slots + 1 pad
+/// = 64 bytes:
 /// ```
-/// [top-0x38] saved r15 = 0   <-- Context.rsp points here
-/// [top-0x30] saved r14 = 0
-/// [top-0x28] saved r13 = 0
-/// [top-0x20] saved r12 = 0
-/// [top-0x18] saved rbx = 0
-/// [top-0x10] saved rbp = 0
-/// [top-0x08] fake return address -> task_trampoline
-/// [top-0x00] (nothing — RSP lands here after the first `ret`)
+/// [top-0x40] saved r15 = 0   <-- Context.rsp points here
+/// [top-0x38] saved r14 = 0
+/// [top-0x30] saved r13 = 0
+/// [top-0x28] saved r12 = 0
+/// [top-0x20] saved rbx = 0
+/// [top-0x18] saved rbp = 0
+/// [top-0x10] fake return address -> task_trampoline
+/// [top-0x08] PAD — never read; exists purely for ABI parity
+/// [top-0x00] (RSP lands here after the first `ret`)
 /// ```
-/// The first switch loads RSP = top-0x38, pops six zeros, `ret`s into the
-/// trampoline with RSP = top (16-byte aligned — the trampoline's `call`s
-/// re-establish the 8-mod inside the callee, as SysV requires).
+/// The first switch loads RSP = top-0x40, pops six zeros, `ret`s into the
+/// trampoline with RSP = top-0x08.
 ///
-/// Alignment proof: `top % 16 == 0` (TaskStack contract), 56 % 16 == 8, so
-/// `(top - 56) % 16 == 8` — exactly the post-`call` invariant the switch's
-/// restore path demands.
+/// Alignment proof (the reason for the 8-byte PAD): the resumed rsp is
+/// `saved + 64` (48 bytes of pops + 8 of `ret`). ABI requires it to be
+/// `8 (mod 16)` — i.e. exactly the state a callee sees right after `call`
+/// pushed its return address. `top` is 16-byte aligned, so the START of the
+/// frame must be `0 (mod 16)` and the frame must be 64 bytes: `saved + 64`
+/// = `top - 64 + 64` = `top - 8` → `8 (mod 16)`. The old 56-byte frame
+/// resumed at `top` → `0 (mod 16)`: a silent ABI violation (caught on QEMU
+/// by the entry assert in [`task_trampoline_body`]) that would misalign
+/// every 16-byte SSE spill in the task's call chain.
 fn init_task_context(top: u64) -> Context {
     assert_eq!(top % 16, 0, "task stack top must be 16-byte aligned");
-    let rsp = top - 56;
-    assert_eq!(rsp % 16, 8, "bootstrap math broke the rsp%16==8 invariant");
+    let rsp = top - 64;
+    assert_eq!(
+        rsp % 16,
+        0,
+        "bootstrap frame must start 16-aligned to resume at 8 (mod 16)"
+    );
+    assert_eq!((rsp + 56) % 16, 8, "resumed rsp would break the ABI parity");
     unsafe {
         let slots = rsp as *mut u64;
         // Six zeroed saved registers...
         for i in 0..6 {
             slots.add(i).write(0);
         }
-        // ...plus the fake return address on top.
+        // ...plus the fake return address (pad slot stays untouched).
         slots.add(6).write(task_trampoline as *const () as u64);
+        slots.add(7).write(0);
     }
     Context { rsp }
 }
@@ -202,8 +215,40 @@ fn init_task_context(top: u64) -> Context {
 /// `-> !`: it never returns through the normal path — every exit is a
 /// `context_switch` back. If a bug ever falls through, the trailing
 /// `hlt`-loop is the backstop, not a return into garbage.
+/// RSP captured the moment the first switch lands in [`task_trampoline`].
+/// The ABI demands `rsp % 16 == 8` at a function's entry point; a bootstrap
+/// frame that resumes a task at the wrong parity corrupts EVERY frame in the
+/// task's call chain (any 16-byte-aligned SSE spill becomes misaligned), so
+/// the invariant is captured here and asserted instead of argued about.
+static mut TRAMPOLINE_ENTRY_RSP: u64 = 0;
+
+#[unsafe(naked)]
 extern "C" fn task_trampoline() -> ! {
+    naked_asm!(
+        "mov [rip + {slot}], rsp",
+        "jmp {body}",
+        slot = sym TRAMPOLINE_ENTRY_RSP,
+        body = sym task_trampoline_body,
+    )
+}
+
+/// The real trampoline body (see [`task_trampoline`] for the entry shim).
+///
+/// Entered by `jmp` with the same RSP the shim captured — so this function's
+/// own prologue sees exactly the state the ABI promises. Asserts that parity
+/// on the first entry: the bootstrap frame is the only place in the kernel
+/// that fabricates a function-entry state out of thin air, and getting it
+/// wrong is silent until some unrelated task declares an `f64`.
+extern "C" fn task_trampoline_body() -> ! {
     unsafe {
+        let entry_rsp = core::ptr::read_volatile(&raw const TRAMPOLINE_ENTRY_RSP);
+        assert_eq!(
+            entry_rsp % 16,
+            8,
+            "ABI violation: task entered with rsp%16 == {} (must be 8) — \
+             the bootstrap frame's alignment math is wrong",
+            entry_rsp % 16
+        );
         let task = &mut *CURRENT_TASK;
         // Resume lands HERE (after the yield-switch below), not at function
         // top: the loop re-runs the next step on every re-entry. First entry
@@ -434,23 +479,22 @@ pub const CFS_DEFAULT_WEIGHT: u32 = 1024;
 #[cfg(feature = "sched-cfs")]
 pub const CFS_BASE_SLICE: u64 = 100;
 
-/// Next free preempt-table slot index (0..MAX_TASKS). Bumped by [`Task::new`]
-/// at spawn under IF=0 (no task running yet — the driver spawns before
-/// `schedule_once`). `u8::MAX` = table full (refuses to build more tasks).
-static mut NEXT_SLOT: u8 = 0;
-
-/// Allocate the next preempt-table slot. Panics if [`crate::preempt::MAX_TASKS`]
-/// is exhausted — the demo spawns a fixed set, so overflow is a config bug.
+/// Allocate a free preempt-table slot from the occupancy bitmap. Lazy-first-
+/// free, NOT a monotone counter: a monotone counter never reuses slots, so a
+/// long-lived kernel that spawns and reaps tasks would exhaust the table
+/// while slots sat free (the bitmap in `preempt` is already the source of
+/// truth for occupancy, so the allocator asks it directly).
+/// Panics when [`crate::preempt::MAX_TASKS`] is genuinely full — a refused
+/// spawn must be loud, never a silent overwrite of a live slot.
 fn alloc_slot() -> u8 {
-    unsafe {
-        let s = NEXT_SLOT;
-        assert!(
-            (s as usize) < crate::preempt::MAX_TASKS,
-            "preempt: task table full (bump MAX_TASKS)"
-        );
-        NEXT_SLOT += 1;
-        s
+    use crate::preempt::{MAX_TASKS, SLOT_USED};
+    let used = SLOT_USED.load(core::sync::atomic::Ordering::Relaxed);
+    for idx in 0..MAX_TASKS {
+        if used & (1 << idx) == 0 {
+            return idx as u8;
+        }
     }
+    panic!("preempt: task table full ({MAX_TASKS} slots) — reap finished tasks or raise MAX_TASKS");
 }
 
 impl Task {
@@ -718,6 +762,10 @@ impl Scheduler for RoundRobin {
                     task.name,
                     task.runs
                 );
+                // Release the preempt-table slot NOW: the frame is wiped to
+                // its invalid template so a stray yank (or a later snapshot)
+                // can never read a rip pointing at this task's freed stack.
+                crate::preempt::unregister_task(task.slot as usize);
                 self.finished_runs.push((task.id, task.name, task.runs));
             }
             return true;
@@ -885,6 +933,9 @@ impl Scheduler for Cfs {
                 task.runs,
                 task.vruntime
             );
+            // Same slot release as RR: wipe the frame before the Box (and
+            // with it the stack) is dropped — no stale rip survives.
+            crate::preempt::unregister_task(task.slot as usize);
             self.finished_runs.push((task.id, task.name, task.runs));
         }
         true

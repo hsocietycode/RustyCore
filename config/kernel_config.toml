@@ -11,6 +11,9 @@ cpu = "x86-64-v2" # v2 = совместимость везде; v3 = макси�
 
 [sched]
 default = "rr" # rr | cfs
+# ВНИМАНИЕ: пока НЕ читается. Прерывание идёт от периодического LAPIC-таймера,
+# квант задаётся калибровкой (10 мс), а не этим ключом. Пометка оставлена,
+# чтобы не создавать ложного впечатления, что ключ что-то меняет.
 quantum_us = 1000
 
 [memory]
@@ -19,18 +22,22 @@ phys_offset = "0xFFFF800000000000"
 heap_size_kb = 1024
 stack_size = "128K"
 # bump = bring-up (no reclaim); buddy = production (split/merge + reclaim).
-# Значение обязано совпадать с Cargo-фичой, иначе сборка падает с объяснением.
+# Значение обязано совпадать с Cargo-фичой, иначе сборка упадает с объяснением.
 frame_allocator = "buddy" # bump | buddy
 # Heap self-test (Box+Vec) при каждом буте. true = ловить битую кучу сразу,
 # false = пропустить ради скорости (heap всё равно инициализируется).
 self_test = true
 
 [drivers]
+# drv-uart читается Cargo-фичами; virtio/ps2kbd пока только информационные —
+# их подсистемы приходят в Phase 4 (VirtIO blk/net, PS/2 keyboard decode).
 uart = true
 virtio = true
 ps2kbd = false
 
 [log]
+# ВНИМАНИЕ: пока НЕ читается. Уровень задаётся наличием/отсутствием
+# serial_println! на конкретных путях, а не этим ключом.
 level = "info" # trace | debug | info | warn | error
 
 # Читает ТОЛЬКО `cargo xtask run-qemu` (единственный потребитель).
