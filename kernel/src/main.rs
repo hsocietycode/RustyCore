@@ -9,6 +9,7 @@ mod gdt;
 mod idt;
 mod interrupts;
 mod memory;
+mod preempt;
 mod serial;
 mod syscall;
 mod task;
@@ -235,7 +236,35 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // rsp0 is updated on every switch, and every QUANTUM_TICKS-th LAPIC tick
     // raises a preempt point that the driver observes and logs. Still
     // cooperative (the driver paces on LAPIC ticks, tasks yield by returning
-    // into the trampoline) — preemptive switch-from-IRQ is a later step.
+    // into the trampoline) — the full yank-mid-step lands later this step.
+    // Step 4 proof block (runs BEFORE the demo): the naked stub must assemble
+    // and its fence must be DOWN on the boot stack (nobody set it — no task
+    // runs yet), the EOI base must be published (apic::init ran), and every
+    // spawned task's preempt frame must validate (fresh-frame proof).
+    {
+        use core::sync::atomic::Ordering;
+        let fence =
+            unsafe { core::ptr::read_volatile(&raw const crate::preempt::PREEMPTIBLE_BYTE) };
+        assert_eq!(
+            fence, 0,
+            "preempt fence UP on boot stack — trampoline leaked it"
+        );
+        let eoi = unsafe { core::ptr::read_volatile(&raw const crate::preempt::EOI_BASE) };
+        assert_ne!(
+            eoi, 0,
+            "preempt EOI base unpublished — apic::init didn't run?"
+        );
+        // Touch the stub's address so a stub that stops assembling (or gets
+        // GC'd as dead code) breaks the build HERE, loudly, not silently.
+        let stub = crate::preempt::lapic_preempt_stub as *const () as u64;
+        assert_ne!(stub, 0, "preempt stub address is null");
+        crate::serial_println!(
+            "preempt: fence=down eoi-base={:#x} stub={:#x} switches={} (proof block ok)",
+            eoi,
+            stub,
+            crate::preempt::PREEMPT_SWITCHES.load(Ordering::Relaxed),
+        );
+    }
     serial_println!("sched: phase 3 demo — 3 tasks + napper, own stacks, preempt clock...");
     {
         use crate::task::{Scheduler, Task};

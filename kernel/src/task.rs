@@ -36,6 +36,7 @@
 
 use alloc::{boxed::Box, collections::VecDeque, string::String, vec::Vec};
 use core::arch::naked_asm;
+use x86_64::instructions::segmentation::Segment as _;
 
 /// Per-task kernel stack size in bytes, wired from `stack_size = "128K"` in
 /// `config/kernel_config.toml` by build.rs (decimal bytes string).
@@ -251,7 +252,12 @@ extern "C" fn task_trampoline() -> ! {
                 }
             }
             // IRQs back on: we are on a real task stack now, handlers run.
+            // Fence UP: from here until the yield `cli` below, the CPU is on
+            // a task stack with IF=1 — the preempt stub may yank us mid-step.
+            // (Set AFTER sti: a tick in the 2-instruction window sees
+            // fence=false and defers one quantum — correct, not lost.)
             x86_64::instructions::interrupts::enable();
+            crate::preempt::set_preemptible(true);
             let alive = (task.step)();
             task.runs += 1;
             task.state = if alive {
@@ -259,6 +265,9 @@ extern "C" fn task_trampoline() -> ! {
             } else {
                 TaskState::Finished
             };
+            // Fence DOWN first, then IRQs off: from here the stack is
+            // half-switch territory — IRQ time must not touch it.
+            crate::preempt::set_preemptible(false);
             // IRQs off before switching stacks — IRQ time must never see a
             // half-switched RSP.
             x86_64::instructions::interrupts::disable();
@@ -365,14 +374,23 @@ pub enum TaskState {
     Finished,
 }
 
-/// A task: a named step function with an id, a ledger, its own stack, and
-/// its own [`Context`].
+/// A task: a named step function with an id, a ledger, its own stack, its
+/// own cooperative [`Context`], and its own preempt [`FullFrame`](crate::preempt::FullFrame).
 ///
 /// The step function runs once per switch and returns `true` to stay ready
 /// or `false` to finish. The closure NEVER runs on the driver's stack — the
 /// scheduler switches onto the task's stack, the [`task_trampoline`] runs
 /// one step there, and switches back. `runs`/`state` are updated by the
 /// trampoline, not by the driver.
+///
+/// Two saved states, NEVER shared: `ctx` (cooperative, ret-based — the yield
+/// path) and `preempt` (preemptive, iret-based — the yank path). A `rsp`
+/// saved by one path is garbage to the other (6 pushed regs + `ret` vs 15
+/// spilled regs + hw frame + `iretq`), so they live in separate slots. The
+/// cooperative path touches only `ctx`; the preempt stub touches only
+/// `preempt`. Fresh tasks synthesize `preempt` at spawn (`FullFrame::fresh`
+/// into the trampoline) so the FIRST resume already goes through `iretq` —
+/// one resume path, zero special cases in the stub.
 pub struct Task {
     /// Stable number, handed out by the scheduler. Log lines carry it so
     /// the interleave is readable (`task 1/alpha`, not anonymous noise).
@@ -403,7 +421,18 @@ pub struct Task {
     pub stack: TaskStack,
     /// Saved switch state, built by [`init_task_context`] at spawn. The
     /// driver switches TO this; the trampoline switches AWAY from it.
+    /// Cooperative path ONLY — the preempt stub never touches this (it has
+    /// its own [`preempt`](crate::preempt::FullFrame) slot below).
     pub ctx: Context,
+    /// Preempt slot: the yank-mid-step state. Synthesized at spawn
+    /// (`FullFrame::fresh` into the trampoline — the first resume already
+    /// goes through `iretq`), overwritten by the stub on every yank with
+    /// the EXACT interrupted state (15 GPRs + hw rip/cs/rflags + pre-IRQ
+    /// rsp + magic). Validated by `valid_for(stack.bottom, stack.top)`
+    /// before every `iretq` — a bad frame halts loudly, never jumps.
+    /// Cooperative `ctx` above and this slot NEVER share: 6-reg `ret`
+    /// layout vs 15-reg + hw `iretq` layout.
+    pub preempt: crate::preempt::FullFrame,
     /// The work. `FnMut` — tasks may mutate captured state across runs.
     /// Called ONLY by the trampoline, on the task's own stack.
     step: Box<dyn FnMut() -> bool>,
@@ -424,19 +453,31 @@ pub const CFS_BASE_SLICE: u64 = 100;
 
 impl Task {
     /// Build a task. Starts [`TaskState::Ready`], zero runs, fresh stack +
-    /// bootstrapped context (first switch `ret`s into the trampoline).
+    /// bootstrapped context (first switch `ret`s into the trampoline) +
+    /// synthesized preempt frame (first `iretq` lands in the trampoline —
+    /// one resume path, validated by `valid_for`).
     /// Default CFS weight ([`CFS_DEFAULT_WEIGHT`]); override with
     /// [`Task::with_weight`] before spawn.
     pub fn new(id: usize, name: &str, step: impl FnMut() -> bool + 'static) -> Self {
         let stack = TaskStack::new();
         let ctx = init_task_context(stack.top);
+        // Fresh preempt frame: rip = trampoline, cs = current code segment,
+        // rsp = stack top. First yank-resume goes through iretq like any other.
+        let cs = x86_64::instructions::segmentation::CS::get_reg().0;
+        let preempt =
+            crate::preempt::FullFrame::fresh(task_trampoline as *const () as u64, cs, stack.top);
+        assert!(
+            preempt.valid_for(stack.bottom, stack.top),
+            "fresh preempt frame failed its own validation"
+        );
         crate::serial_println!(
-            "sched: task {}/{} stack top {:#x} ({} KiB) ctx.rsp={:#x}",
+            "sched: task {}/{} stack top {:#x} ({} KiB) ctx.rsp={:#x} preempt rip={:#x}",
             id,
             name,
             stack.top,
             STACK_SIZE_BYTES / 1024,
             ctx.rsp,
+            preempt.rip,
         );
         Self {
             id,
@@ -449,6 +490,7 @@ impl Task {
             weight: CFS_DEFAULT_WEIGHT,
             stack,
             ctx,
+            preempt,
             step: Box::new(step),
         }
     }
@@ -467,7 +509,8 @@ impl Task {
     /// Build a task parked asleep until `until_tick` (APIC_TICKS domain).
     /// The scheduler carries it through the queue untouched until the tick
     /// arrives — no busy-wait, the caller hlt-sleeps between passes.
-    /// Stack + context are bootstrapped at spawn like any other task.
+    /// Stack + context + preempt frame are bootstrapped at spawn like any
+    /// other task.
     pub fn sleeping(
         id: usize,
         name: &str,
@@ -476,13 +519,21 @@ impl Task {
     ) -> Self {
         let stack = TaskStack::new();
         let ctx = init_task_context(stack.top);
+        let cs = x86_64::instructions::segmentation::CS::get_reg().0;
+        let preempt =
+            crate::preempt::FullFrame::fresh(task_trampoline as *const () as u64, cs, stack.top);
+        assert!(
+            preempt.valid_for(stack.bottom, stack.top),
+            "fresh preempt frame failed its own validation"
+        );
         crate::serial_println!(
-            "sched: task {}/{} stack top {:#x} ({} KiB) ctx.rsp={:#x}",
+            "sched: task {}/{} stack top {:#x} ({} KiB) ctx.rsp={:#x} preempt rip={:#x}",
             id,
             name,
             stack.top,
             STACK_SIZE_BYTES / 1024,
             ctx.rsp,
+            preempt.rip,
         );
         Self {
             id,
@@ -495,6 +546,7 @@ impl Task {
             weight: CFS_DEFAULT_WEIGHT,
             stack,
             ctx,
+            preempt,
             step: Box::new(step),
         }
     }
@@ -629,7 +681,16 @@ impl Scheduler for RoundRobin {
                 switch_to_task(&mut *task as *mut Task);
             }
             // Back on the boot stack. The trampoline ran exactly one step on
-            // the task's stack and set state+runs — read the verdict.
+            // the task's stack and set state+runs — read the verdict. Step 4
+            // proof: the preempt slot must still validate (magic intact, rsp
+            // in-window) — the cooperative path never touches it, so a broken
+            // frame here means someone scribbled across slots.
+            assert!(
+                task.preempt.valid_for(task.stack.bottom, task.stack.top),
+                "task {}/{} preempt frame trashed by cooperative path",
+                task.id,
+                task.name,
+            );
             if task.state == TaskState::Ready {
                 self.ready.push_back(task);
             } else {
@@ -771,6 +832,14 @@ impl Scheduler for Cfs {
         unsafe {
             switch_to_task(&mut *task as *mut Task);
         }
+        // Step 4 proof (same as RR): the cooperative path must not scribble
+        // the preempt slot — a trashed frame here means crossed wires.
+        assert!(
+            task.preempt.valid_for(task.stack.bottom, task.stack.top),
+            "task {}/{} preempt frame trashed by cooperative path",
+            task.id,
+            task.name,
+        );
         // Back on the boot stack: accrue vruntime for the step just run.
         // Saturating + divide-guarded: weight > 0 by spawn assert, but
         // belt and suspenders — a zero here would be a div-by-zero in IRQ

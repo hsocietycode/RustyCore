@@ -139,6 +139,10 @@ pub fn init(
     }
     let base = crate::memory::map_mmio_window(mapper, frame_allocator, probe.base)?;
     LAPIC_VIRT.store(base.as_u64(), core::sync::atomic::Ordering::Relaxed);
+    // Publish the EOI register address to the naked preempt stub (Phase 3
+    // Step 4): the stub EOIs with pure asm (no Rust call, no stack use), so
+    // it reads this static. Single writer here (IF=0, no task running).
+    crate::preempt::set_eoi_base(base.as_u64() + EOI_OFFSET);
 
     // SAFETY: `base` is the mapped LAPIC window (one MMIO page); offsets
     // are architecturally fixed u32 registers. Volatile: the compiler must
