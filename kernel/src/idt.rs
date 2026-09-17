@@ -68,7 +68,16 @@ lazy_static! {
         // APIC sidecars (Step 2): registered but silent until Step 5 maps
         // and enables the LAPIC. DPL stays Ring0 — no userspace yet.
         idt[SYSCALL_VECTOR].set_handler_fn(syscall_stub_handler);
-        idt[LAPIC_TIMER_VECTOR].set_handler_fn(apic_timer_handler);
+        // Step 4: the LAPIC timer vector is the NAKED preempt stub (not an
+        // x86-interrupt fn — its compiler-matched iretq epilogue would fight
+        // a stack switch). set_handler_addr installs a 64-bit interrupt gate
+        // (IF=0 through the stub), DPL 0, IST 0 (stay on the task stack).
+        unsafe {
+            idt[LAPIC_TIMER_VECTOR]
+                .set_handler_addr(x86_64::VirtAddr::new(
+                    crate::preempt::lapic_preempt_stub as *const () as u64,
+                ));
+        }
         idt[LAPIC_ERROR_VECTOR].set_handler_fn(apic_error_handler);
         // Spurious sinks (architecturally expected noise, not faults): the
         // 0xFF APIC spurious vector SVR points at, and the two classic PIC
@@ -160,26 +169,9 @@ extern "x86-interrupt" fn syscall_stub_handler(_stack_frame: InterruptStackFrame
     crate::serial_println!("syscall: stub hit count={}", n);
 }
 
-/// LAPIC timer (Step 5 fires this). Counts ticks, then EOI straight to the
-/// local APIC — the 8259 never sees LAPIC vectors, so no PIC ack here.
-///
-/// Cannot fire before Step 5 by hardware contract: LVT entries reset masked
-/// and SVR resets disabled, so no local-APIC source can raise until bring-up
-/// unmasks them. If one ever does slip through early (stray 0xEF in the gap
-/// between `idt::init` and `apic::init`), the `Err` path logs loudly instead
-/// of panicking inside the interrupt — a panic here would double-panic.
-extern "x86-interrupt" fn apic_timer_handler(_stack_frame: InterruptStackFrame) {
-    use core::sync::atomic::Ordering;
-    APIC_TICKS.fetch_add(1, Ordering::Relaxed);
-    // Phase 3 Step 2b: feed the preemption policy its clock. Cheap atomics
-    // only — no locking, no printing at IRQ time (serial reentrancy with
-    // task prints would garble the log; the handler also runs on task
-    // stacks now, so minimal frame usage matters). The driver observes it.
-    crate::task::timer_tick();
-    if let Err(e) = crate::apic::eoi() {
-        crate::serial_println!("apic-timer: stray fire ({}), ignored", e);
-    }
-}
+// LAPIC timer is now handled by the NAKED preempt stub in [`crate::preempt`]
+// (Step 4). The stub does APIC_TICKS++ + EOI + iretq itself (no cooperative
+// `timer_tick` from IRQ anymore); the driver paces on `APIC_TICKS`.
 
 /// LAPIC error (ESR). Loud by design: print and continue — a masked error
 /// vector that nobody reads is how silent interrupt loss starts.

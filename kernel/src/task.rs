@@ -22,17 +22,18 @@
 //! - Lock discipline: NO lock is ever held across the `asm!` switch. The
 //!   queue is popped/pushed with plain `&mut self` (main drives the loop,
 //!   no Mutex involved); the switch itself takes only raw pointers.
-//! - Preemption clock: [`timer_tick`] (called from the LAPIC handler, IRQ
-//!   context, atomics only) raises [`NEED_RESCHED`] every [`QUANTUM_TICKS`]
-//!   ticks; the driver observes it via [`take_preempt_flag`].
+//! - Preemption: the LAPIC 0xEF vector is a `#[unsafe(naked)]` stub
+//!   ([`crate::preempt::lapic_preempt_stub`]) that yanks a running task
+//!   mid-step, saves its full frame into a static table slot, and resumes it
+//!   exactly where the timer hit. [`PREEMPT_SWITCHES`](crate::preempt::PREEMPT_SWITCHES)
+//!   counts real yanks — the driver reads the delta and logs each one.
 //! - A boot demo: three tasks + a napper, stacks printed at spawn, the log
-//!   shows the interleave AND the preempt points, the ledger proves nobody
+//!   shows the interleave AND the real yanks, the ledger proves nobody
 //!   starved.
 //!
-//! Still cooperative (the driver paces on LAPIC ticks, tasks yield by
-//! returning) — preemptive switch-from-IRQ is a later step. Still ring 0
-//! only: `TSS.rsp0` is updated on every switch as proof of the path, but no
-//! hardware reads it yet (ring transitions don't happen at CPL 0).
+//! Still ring 0 only: `TSS.rsp0` is updated on every switch as proof of the
+//! path, but no hardware reads it yet (ring transitions don't happen at
+//! CPL 0).
 
 use alloc::{boxed::Box, collections::VecDeque, string::String, vec::Vec};
 use core::arch::naked_asm;
@@ -55,40 +56,11 @@ const fn parse_stack_bytes() -> usize {
     n
 }
 
-/// Preemption quantum in LAPIC ticks. The LAPIC ticks at ~100 Hz, so 10 ticks
-/// ≈ 100 ms before the timer asks for a reschedule. Named, not magic — the
-/// flag is still observed-only (the driver logs preempt points); ENFORCING
-/// the quantum (yanking a running task mid-step) is the preemptive step's
-/// job, not this cooperative one's.
-pub const QUANTUM_TICKS: u64 = 10;
-
-/// Set by [`timer_tick`] when a quantum expires, cleared by main when it
-/// observes a reschedule point. The LAPIC handler never schedules directly
-/// (no locking, no queue surgery at IRQ time) — it only raises the flag.
-pub static NEED_RESCHED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// Ticks seen by the scheduler layer (mirrors `APIC_TICKS`, counted here so
-/// the preemption policy owns its own clock reading).
-pub static PREEMPT_TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// Called from the LAPIC timer handler (IRQ context): cheap atomics only,
-/// no locking, no printing — serial from IRQ time risks reentrancy with
-/// main's own prints. Every [`QUANTUM_TICKS`]-th tick raises NEED_RESCHED.
-pub fn timer_tick() {
-    use core::sync::atomic::Ordering;
-    let t = PREEMPT_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-    if t.is_multiple_of(QUANTUM_TICKS) {
-        NEED_RESCHED.store(true, Ordering::Relaxed);
-    }
-}
-
-/// Take the reschedule flag (swap to false): `true` means a quantum expired
-/// since the last check. Main calls this at schedule points — IRQ time only
-/// ever SETS the flag, never clears it, so no tick is lost between checks.
-pub fn take_preempt_flag() -> bool {
-    NEED_RESCHED.swap(false, core::sync::atomic::Ordering::Relaxed)
-}
+// The cooperative preempt-clock (QUANTUM_TICKS / NEED_RESCHED /
+// PREEMPT_TICKS / timer_tick / take_preempt_flag) is GONE — Step 4's naked
+// stub IS the preemption now. The stub bumps APIC_TICKS (the driver's
+// pacemaker) and PREEMPT_SWITCHES (yank count); the driver reads those
+// directly instead of polling a cooperative quantum flag.
 
 /// Saved CPU state for one side of a cooperative switch.
 ///
@@ -286,6 +258,10 @@ extern "C" fn task_trampoline() -> ! {
 unsafe fn switch_to_task(task: *mut Task) {
     unsafe {
         CURRENT_TASK = task;
+        // Publish the preempt-table index so the LAPIC stub knows which slot
+        // to yank THIS task's frame into. Set BEFORE sti (the trampoline
+        // re-sti's) — the stub reads CURRENT_IDX only when the fence is up.
+        crate::preempt::set_current((*task).slot as usize);
         // rsp0 proof-of-path: updated on EVERY switch, read by hardware only
         // once ring 3 arrives. Today it is bookkeeping with a purpose — the
         // hook exists, the value is right, the consumer comes later.
@@ -293,6 +269,8 @@ unsafe fn switch_to_task(task: *mut Task) {
         x86_64::instructions::interrupts::disable();
         context_switch(&raw mut SCHED_CTX, &(*task).ctx as *const Context);
         // Back on the boot stack: the task disabled IRQs before switching.
+        // Clear the index — the stub must NOT yank into the driver.
+        crate::preempt::set_current(crate::preempt::MAX_TASKS);
         x86_64::instructions::interrupts::enable();
     }
 }
@@ -433,6 +411,11 @@ pub struct Task {
     /// Cooperative `ctx` above and this slot NEVER share: 6-reg `ret`
     /// layout vs 15-reg + hw `iretq` layout.
     pub preempt: crate::preempt::FullFrame,
+    /// Preempt table slot index ([`crate::preempt::TASK_FRAMES`]), assigned
+    /// at spawn. `u8::MAX` = unregistered (never scheduled — spawn registers
+    /// before that). Published to `CURRENT_IDX` by [`switch_to_task`] so the
+    /// stub knows which slot to yank into.
+    pub slot: u8,
     /// The work. `FnMut` — tasks may mutate captured state across runs.
     /// Called ONLY by the trampoline, on the task's own stack.
     step: Box<dyn FnMut() -> bool>,
@@ -451,11 +434,31 @@ pub const CFS_DEFAULT_WEIGHT: u32 = 1024;
 #[cfg(feature = "sched-cfs")]
 pub const CFS_BASE_SLICE: u64 = 100;
 
+/// Next free preempt-table slot index (0..MAX_TASKS). Bumped by [`Task::new`]
+/// at spawn under IF=0 (no task running yet — the driver spawns before
+/// `schedule_once`). `u8::MAX` = table full (refuses to build more tasks).
+static mut NEXT_SLOT: u8 = 0;
+
+/// Allocate the next preempt-table slot. Panics if [`crate::preempt::MAX_TASKS`]
+/// is exhausted — the demo spawns a fixed set, so overflow is a config bug.
+fn alloc_slot() -> u8 {
+    unsafe {
+        let s = NEXT_SLOT;
+        assert!(
+            (s as usize) < crate::preempt::MAX_TASKS,
+            "preempt: task table full (bump MAX_TASKS)"
+        );
+        NEXT_SLOT += 1;
+        s
+    }
+}
+
 impl Task {
     /// Build a task. Starts [`TaskState::Ready`], zero runs, fresh stack +
     /// bootstrapped context (first switch `ret`s into the trampoline) +
     /// synthesized preempt frame (first `iretq` lands in the trampoline —
-    /// one resume path, validated by `valid_for`).
+    /// one resume path, validated by `valid_for`). Registers the frame in
+    /// the static preempt table at a fresh slot (the stub yanks by index).
     /// Default CFS weight ([`CFS_DEFAULT_WEIGHT`]); override with
     /// [`Task::with_weight`] before spawn.
     pub fn new(id: usize, name: &str, step: impl FnMut() -> bool + 'static) -> Self {
@@ -470,14 +473,17 @@ impl Task {
             preempt.valid_for(stack.bottom, stack.top),
             "fresh preempt frame failed its own validation"
         );
+        let slot = alloc_slot();
+        crate::preempt::register_task(slot as usize, preempt);
         crate::serial_println!(
-            "sched: task {}/{} stack top {:#x} ({} KiB) ctx.rsp={:#x} preempt rip={:#x}",
+            "sched: task {}/{} stack top {:#x} ({} KiB) ctx.rsp={:#x} preempt rip={:#x} slot={}",
             id,
             name,
             stack.top,
             STACK_SIZE_BYTES / 1024,
             ctx.rsp,
             preempt.rip,
+            slot,
         );
         Self {
             id,
@@ -491,6 +497,7 @@ impl Task {
             stack,
             ctx,
             preempt,
+            slot,
             step: Box::new(step),
         }
     }
@@ -526,14 +533,17 @@ impl Task {
             preempt.valid_for(stack.bottom, stack.top),
             "fresh preempt frame failed its own validation"
         );
+        let slot = alloc_slot();
+        crate::preempt::register_task(slot as usize, preempt);
         crate::serial_println!(
-            "sched: task {}/{} stack top {:#x} ({} KiB) ctx.rsp={:#x} preempt rip={:#x}",
+            "sched: task {}/{} stack top {:#x} ({} KiB) ctx.rsp={:#x} preempt rip={:#x} slot={}",
             id,
             name,
             stack.top,
             STACK_SIZE_BYTES / 1024,
             ctx.rsp,
             preempt.rip,
+            slot,
         );
         Self {
             id,
@@ -547,6 +557,7 @@ impl Task {
             stack,
             ctx,
             preempt,
+            slot,
             step: Box::new(step),
         }
     }
@@ -687,7 +698,14 @@ impl Scheduler for RoundRobin {
             // frame here means someone scribbled across slots.
             assert!(
                 task.preempt.valid_for(task.stack.bottom, task.stack.top),
-                "task {}/{} preempt frame trashed by cooperative path",
+                "task {}/{} fresh preempt template trashed",
+                task.id,
+                task.name,
+            );
+            let irq_frame = crate::preempt::snapshot(task.slot as usize);
+            assert!(
+                irq_frame.valid_for(task.stack.bottom, task.stack.top),
+                "task {}/{} IRQ-stashed frame invalid",
                 task.id,
                 task.name,
             );
@@ -836,7 +854,14 @@ impl Scheduler for Cfs {
         // the preempt slot — a trashed frame here means crossed wires.
         assert!(
             task.preempt.valid_for(task.stack.bottom, task.stack.top),
-            "task {}/{} preempt frame trashed by cooperative path",
+            "task {}/{} fresh preempt template trashed",
+            task.id,
+            task.name,
+        );
+        let irq_frame = crate::preempt::snapshot(task.slot as usize);
+        assert!(
+            irq_frame.valid_for(task.stack.bottom, task.stack.top),
+            "task {}/{} IRQ-stashed frame invalid",
             task.id,
             task.name,
         );

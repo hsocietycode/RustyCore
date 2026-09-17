@@ -11,32 +11,34 @@
 //!   `#[unsafe(naked)]` stub installed via `set_handler_addr`, interrupt gate
 //!   (IF=0 through the whole stub), DPL 0, IST 0 (stay on the task stack).
 //! - Ring-0 IRQ pushes only THREE words (rip/cs/rflags — no rsp/ss without a
-//!   privilege change, no error code). The stub spills all 15 GPRs, stashes
-//!   the frame into a static slot, picks next via the scheduler's
-//!   try-only IRQ path, and `iretq`s into the next task's saved frame.
+//!   privilege change, no error code). The stub spills all 15 GPRs and stashes
+//!   the exact frame into a static slot (`TASK_FRAMES`), then restores and
+//!   `iretq`s — the yanked task resumes precisely where the timer hit it.
 //! - NO `call` inside the stub: SysV alignment at IRQ entry is arbitrary
 //!   (mid-step compiler state minus 24 bytes of HW push), so a `call` would
 //!   need an explicit `and rsp,-16` dance with fixup math that forgets bytes.
-//!   Instead the stub is pure asm end-to-end; policy runs in `pick_next_irq`
-//!   (plain Rust, `try_lock` only, no alloc/print) operating on static slots.
-//! - The scheduler's IRQ-visible state lives in statics (fixed slots,
-//!   runqueue of indices — no `Box`, no alloc, no move in IRQ context). The
-//!   driver allocates and reaps with IF=0; the handler only swaps indices
-//!   and copies bytes.
-//! - `PREEMPTIBLE` fence: `true` only inside the trampoline's step window
+//!   The stub is pure asm end-to-end; the driver and the Rust side read the
+//!   static slots afterwards with the fence down.
+//! - Cross-task resume (skip the cooperative driver entirely) is the next
+//!   increment: a ring-0 `iretq` does NOT restore RSP, so resuming a DIFFERENT
+//!   task's frame needs an explicit `mov rsp, [frame.rsp]` over that task's own
+//!   stack. Today the stub proves save/restore on the SAME task — every offset,
+//!   the table indexing, and the register round-trip are exercised for real.
+//! - `PREEMPTIBLE` fence: `1` only inside the trampoline's step window
 //!   (after `sti`, before the yield `cli`). The stub checks it first — if the
-//!   CPU is on the boot stack, in the driver, or mid-switch, the frame is
-//!   discarded: ticks counted, EOI sent, `iretq` back to the SAME stack.
+//!   CPU is on the boot stack, in the driver, or mid-switch, nothing is
+//!   stashed: ticks counted, EOI sent, `iretq` back to the SAME stack.
 //!   Driver-vs-IRQ ownership race removed by construction.
 //! - Cooperative `ctx` (ret-based) and preempt frame (iret-based) are SEPARATE
 //!   slots: a `rsp` saved by one path is garbage to the other, so they never
 //!   share. Fresh tasks get a SYNTHESIZED hw frame (rip=trampoline,
-//!   cs=kernel CS, rflags=0x202) and resume through the same `iretq`.
-//! - Zero printing, zero blocking-lock, zero allocation in the stub. Ticks
-//!   still counted here (`APIC_TICKS`/`PREEMPT_TICKS`/`timer_tick`) — the
-//!   driver's `hlt` loop waits on them, so a silent stub would stall boot.
+//!   cs=kernel CS, rflags=0x202) for the eventual cross-task `iretq`.
+//! - Zero printing, zero blocking-lock, zero allocation in the stub.
+//!   `APIC_TICKS` is bumped with `lock inc` — the driver's `hlt` loop waits on
+//!   it, so a silent stub would stall boot.
 
 use core::arch::naked_asm;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 /// Magic at the base of every preempt frame. Checked before `iretq` — a
 /// wrong RSP + `iretq` pops garbage RIP and triple-faults with no log, so
@@ -91,6 +93,32 @@ const _: () = assert!(
 );
 
 impl FullFrame {
+    /// All-zero frame (magic=0 — INVALID by design, so an unregistered slot
+    /// can never be `iretq`-d: `valid_for` rejects magic≠PREEMPT_MAGIC). Used
+    /// to initialize the static table at const-eval time.
+    pub const ZERO: Self = Self {
+        r15: 0,
+        r14: 0,
+        r13: 0,
+        r12: 0,
+        r11: 0,
+        r10: 0,
+        r9: 0,
+        r8: 0,
+        rdi: 0,
+        rsi: 0,
+        rbp: 0,
+        rbx: 0,
+        rdx: 0,
+        rcx: 0,
+        rax: 0,
+        rsp: 0,
+        rip: 0,
+        cs: 0,
+        rflags: 0,
+        magic: 0,
+    };
+
     /// Fresh-task frame: first `iretq` lands in `entry` with `stack_top` as
     /// RSP, IF=1 (0x202 = IF + reserved bit 1, which must stay set).
     pub fn fresh(entry: u64, cs: u16, stack_top: u64) -> Self {
@@ -144,34 +172,83 @@ impl FullFrame {
 /// `true` only while a task step runs with IF=1 (set by the trampoline after
 /// `sti`, cleared before the yield `cli`). The stub's first check — `false`
 /// means "not on a task stack or mid-switch": count ticks, EOI, `iretq` back
-/// to SAME. A single byte (not `AtomicBool`): the stub reads it with one
-/// `cmp`, no atomic prefix needed — single CPU, IF=0 through the stub, the
-/// trampoline flips it only with IF=0 around the flip... except the set-after-
-/// `sti` flip, which races the timer by design (a tick landing in that window
-/// sees fence=false and defers one quantum — correct, not lost).
-///
-/// `static mut` (NOT plain `static`): the trampoline WRITES this, and a plain
-/// `static` lands in `.rodata` — the first fence flip page-faults (caught on
-/// QEMU: write violation at the static's address). Single writer (the running
-/// task) + single reader (the stub, IF=0) — no data race, but `static mut`
-/// access stays in `unsafe` blocks as the language demands.
-pub static mut PREEMPTIBLE_BYTE: u8 = 0;
+/// to SAME. An `AtomicU8` so the stub reads it with one `cmp` and the
+/// trampoline flips it without `unsafe` — single CPU, IF=0 through the stub,
+/// the trampoline flips it only with IF=0 around the flip... except the
+/// set-after-`sti` flip, which races the timer by design (a tick landing in
+/// that window sees fence=0 and defers one quantum — correct, not lost).
+pub static PREEMPTIBLE: AtomicU8 = AtomicU8::new(0);
+
+/// Max task slots in the static table. Four demo tasks (alpha/beta/gamma/
+/// napper) plus headroom — a real growable table is a later step (today the
+/// driver spawns a fixed set, so a fixed array is honest, not a limitation
+/// worth a dynamic allocator in IRQ context).
+pub const MAX_TASKS: usize = 8;
+
+/// Static task table: the IRQ-visible scheduling state. Fixed slots, indexed
+/// by `CURRENT_IDX` — no `Box`, no `Vec`, no alloc, no move in IRQ context.
+/// The driver fills a slot at spawn (IF=0); the stub only reads/writes bytes
+/// in place. `FullFrame` is `repr(C)` so field offsets are stable for asm.
+pub static mut TASK_FRAMES: [FullFrame; MAX_TASKS] = [const { FullFrame::ZERO }; MAX_TASKS];
 
 /// How many times the stub actually switched tasks (IRQ-side counter, read by
 /// the driver for the boot log — the stub itself never prints).
 pub static PREEMPT_SWITCHES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Index into [`TASK_FRAMES`] of the currently running task, or `MAX_TASKS`
+/// (one past the end) when the driver is on the boot stack. Set by the driver
+/// before `sti`-ing into a task; advanced by the stub on every real yank.
+/// `AtomicU8` (MAX_TASKS=8 fits): the stub does a single `movzx`+`add`+`cmp`,
+/// no lock — single CPU, IF=0 through the stub.
+pub static CURRENT_IDX: AtomicU8 = AtomicU8::new(MAX_TASKS as u8);
+
+/// How many live task slots the driver has registered (spawned but not yet
+/// reaped). The stub's pick-next advances `CURRENT_IDX` modulo this count,
+/// skipping nothing — every live slot is runnable (the driver parks sleepers
+/// by NOT switching into them, not by marking a slot dead).
+pub static ALIVE_COUNT: AtomicU8 = AtomicU8::new(0);
+
 /// Flip the fence. Called by the trampoline only (IF=0 at both flip points —
-/// see the race note on [`PREEMPTIBLE_BYTE`]: the set flip happens right
-/// after `sti`, so a tick in that 2-instruction window correctly defers).
-///
-/// Single writer (the running task), single-CPU, byte store is atomic —
-/// plain write, no `unsafe` needed (callers already run in an `unsafe` fn,
-/// but the operation itself is a volatile byte store, always sound).
+/// see the race note on [`PREEMPTIBLE`]: the set flip happens right after
+/// `sti`, so a tick in that 2-instruction window correctly defers).
 pub fn set_preemptible(on: bool) {
+    PREEMPTIBLE.store(if on { 1 } else { 0 }, Ordering::Relaxed);
+}
+
+/// Register a task's preempt frame in the static table at index `idx`. Called
+/// by the driver at spawn with IF=0 (no task running yet) — a plain memcpy,
+/// no lock. Bumps `ALIVE_COUNT` once the frame is live. The slot's `FullFrame`
+/// (magic, rsp=stack top, rip=trampoline) is what the FIRST `iretq` resumes.
+pub fn register_task(idx: usize, frame: FullFrame) {
+    assert!(idx < MAX_TASKS, "preempt: task slot overflow");
     unsafe {
-        let p = &raw mut PREEMPTIBLE_BYTE;
-        p.write_volatile(if on { 1 } else { 0 });
+        core::ptr::addr_of_mut!(TASK_FRAMES)
+            .cast::<FullFrame>()
+            .add(idx)
+            .write(frame);
+    }
+    ALIVE_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Publish the running-task index. Called by the driver right before it
+/// switches into a task (so the stub knows which slot to stash the yanked
+/// frame into) and set back to `MAX_TASKS` when the task yields back to the
+/// boot stack.
+pub fn set_current(idx: usize) {
+    CURRENT_IDX.store(idx as u8, Ordering::Relaxed);
+}
+
+/// Snapshot an IRQ-saved frame after the task has yielded back to the driver.
+/// Caller is on the boot stack with the fence down, so the stub cannot write
+/// task slots concurrently. This validates the ACTUAL asm stash, not the
+/// fresh `Task.preempt` template stored in the heap object.
+pub fn snapshot(idx: usize) -> FullFrame {
+    assert!(idx < MAX_TASKS, "preempt: snapshot slot out of range");
+    unsafe {
+        core::ptr::addr_of!(TASK_FRAMES)
+            .cast::<FullFrame>()
+            .add(idx)
+            .read_volatile()
     }
 }
 
@@ -179,90 +256,102 @@ pub fn set_preemptible(on: bool) {
 ///
 /// Entry state (interrupt gate, IF=0): CPU pushed rip/cs/rflags (24 bytes) on
 /// the CURRENT stack (task stack when preemptible, boot stack otherwise).
-/// No prologue, no Rust, no `call` — pure asm:
+/// No prologue, no Rust, no `call` — pure asm. Ring-0 IRQ = 3 HW words only
+/// (rip/cs/rflags — no rsp/ss, no error code).
 ///
-/// 1. Fence: `cmpb PREEMPTIBLE_BYTE, 0` → `je same_stack` (skip spill).
-/// 2. Spill 15 GPRs; stash rip/cs/rflags/rsp+magic into the current task's
-///    preempt slot via `CURRENT_TASK` + field offsets (raw stores only).
-/// 3. `pick_next_irq`: try-lock scheduler, rotate, stash next frame words
-///    into the NEXT task's stack... — full path lands with the static table
-///    commit in `task.rs` (slots + index runqueue + driver alloc/reap).
-///    UNTIL THEN the stub counts ticks, EOIs, and `iretq`s to SAME — a
-///    correct fence+tick handler, never a half-switch.
+/// THIS INCREMENT (part 2): same-task save/restore. When the fence is up, the
+/// stub spills 15 GPRs, STASHES the full frame into `TASK_FRAMES[CURRENT_IDX]`
+/// (proof the table + offsets are correct — a later part reads it back), EOI's,
+/// RESTORES the 15 GPRs, and `iretq`s to the SAME rip the CPU pushed. The
+/// yanked task resumes exactly where it was. `PREEMPT_SWITCHES` counts every
+/// yank that landed on a preemptible task — >0 proves the timer→stub→resume
+/// path is live and the frame didn't corrupt the task.
 ///
-/// Interim discipline (this commit): the IDT keeps the `x86-interrupt`
-/// handler — this stub is NOT installed yet. It must still ASSEMBLE (dead
-/// code that doesn't build is debt), and its fence math is reviewed here so
-/// the table commit only flips the IDT entry, not the stub.
+/// WHY NOT cross-task YET: ring-0 `iretq` does NOT restore RSP (no privilege
+/// change → no SS/RSP pop). Resuming a DIFFERENT task's frame from a static
+/// slot would leave RSP pointing inside the table, not at the task's real
+/// stack — a triple fault. Part 3 restores RSP explicitly (`mov rsp,
+/// [frame.rsp]` over the task's own stack where the HW frame still lives),
+/// which needs the spill to stay on-stack, not copied to a slot. The stash
+/// here is the bridge: it proves the table + offset math is right so part 3
+/// only swaps the resume source, not the save math.
 #[unsafe(naked)]
 pub unsafe extern "C" fn lapic_preempt_stub() {
     naked_asm!(
-        // --- 1. fence check (single byte, rip-relative, no stack use) ---
-        // Intel syntax (the kernel builds with `-C llvm-args=-x86-asm-syntax=intel`
-        // via? NO — default is AT&T. `cmpb` is AT&T-only; in Intel syntax the
-        // mnemonic is `cmp` with an explicit BYTE PTR size. One-byte compare,
-        // no flags preserved needed (IF=0 already, stub owns all flags).
-        "cmp BYTE PTR [rip + {flag}], 0",
+        // --- 0. Save EVERY GPR before using even one as scratch. ---
+        // CPU frame below the spill is [rip, cs, rflags] at +0x78/+0x80/+0x88.
+        "push r15", "push r14", "push r13", "push r12",
+        "push r11", "push r10", "push r9", "push r8",
+        "push rdi", "push rsi", "push rbp", "push rbx",
+        "push rdx", "push rcx", "push rax",
+        // --- 1. ALWAYS bump APIC_TICKS; driver and sleepers depend on it. ---
+        // Atomic memory RMW: honest for AtomicU64 and already SMP-safe. No GPR
+        // scratch, so the saved task register image stays untouched.
+        "lock inc qword ptr [rip + {apic_ticks}]",
+        // Fence down means boot/driver stack: skip the task-table stash.
+        "cmp BYTE PTR [rip + {fence}], 0",
         "je 2f",
-        // --- PREEMPTIBLE path (table commit fills the stash/pick/switch) ---
-        // Spill 15 GPRs (order matches FullFrame: r15 first).
-        "push r15",
-        "push r14",
-        "push r13",
-        "push r12",
-        "push r11",
-        "push r10",
-        "push r9",
-        "push r8",
-        "push rdi",
-        "push rsi",
-        "push rbp",
-        "push rbx",
-        "push rdx",
-        "push rcx",
-        "push rax",
-        // STASH + PICK + SWITCH land with the static table (task.rs commit):
-        // the stub will store rip/cs/rflags (at [rsp+120..144]) + computed
-        // pre-IRQ rsp (rsp+144) + magic into CURRENT_TASK's preempt slot,
-        // rotate the index runqueue under try_lock, validate next frame,
-        // EOI, mov rsp + pop + iretq. Until then: restore the spill and
-        // fall into the common tail — ticks + EOI + same-stack iretq.
-        "pop rax",
-        "pop rcx",
-        "pop rdx",
-        "pop rbx",
-        "pop rbp",
-        "pop rsi",
-        "pop rdi",
-        "pop r8",
-        "pop r9",
-        "pop r10",
-        "pop r11",
-        "pop r12",
-        "pop r13",
-        "pop r14",
-        "pop r15",
-        // --- 2. common tail: EOI the LAPIC + iretq to SAME stack ---
-        // EOI = volatile dword 0 at APIC base + 0xB0. The base is a static
-        // here (set once by apic::init) — no Rust call, no stack use.
-        // (Table commit wires EOI_BASE; until then this address is zero and
-        // the stub is not installed — the tail assembles but never runs.)
+        // Refuse a corrupt/sentinel index before touching TASK_FRAMES.
+        "movzx eax, BYTE PTR [rip + {cur_idx}]",
+        "cmp eax, {max_tasks}",
+        "jae 2f",
+        // Count this real yank (fence up + valid current task index).
+        "lock inc qword ptr [rip + {switches}]",
+        // --- 2. STASH FullFrame into TASK_FRAMES[index]. ---
+        // FullFrame is 20 u64 = 160 (0xA0) bytes, locked by const assert.
+        "imul rax, rax, 0xa0",
+        "lea rdi, [rip + {frames}]",
+        "add rdi, rax",
+        // Stack spill is reverse of FullFrame fields: [rsp]=rax ..
+        // [rsp+0x70]=r15. Copy explicitly in the correct direction.
+        "mov rax, [rsp + 0x70]", "mov [rdi + 0x00], rax", // r15
+        "mov rax, [rsp + 0x68]", "mov [rdi + 0x08], rax", // r14
+        "mov rax, [rsp + 0x60]", "mov [rdi + 0x10], rax", // r13
+        "mov rax, [rsp + 0x58]", "mov [rdi + 0x18], rax", // r12
+        "mov rax, [rsp + 0x50]", "mov [rdi + 0x20], rax", // r11
+        "mov rax, [rsp + 0x48]", "mov [rdi + 0x28], rax", // r10
+        "mov rax, [rsp + 0x40]", "mov [rdi + 0x30], rax", // r9
+        "mov rax, [rsp + 0x38]", "mov [rdi + 0x38], rax", // r8
+        "mov rax, [rsp + 0x30]", "mov [rdi + 0x40], rax", // rdi
+        "mov rax, [rsp + 0x28]", "mov [rdi + 0x48], rax", // rsi
+        "mov rax, [rsp + 0x20]", "mov [rdi + 0x50], rax", // rbp
+        "mov rax, [rsp + 0x18]", "mov [rdi + 0x58], rax", // rbx
+        "mov rax, [rsp + 0x10]", "mov [rdi + 0x60], rax", // rdx
+        "mov rax, [rsp + 0x08]", "mov [rdi + 0x68], rax", // rcx
+        "mov rax, [rsp + 0x00]", "mov [rdi + 0x70], rax", // rax
+        "lea rax, [rsp + 0x90]", "mov [rdi + 0x78], rax", // pre-IRQ rsp
+        "mov rax, [rsp + 0x78]", "mov [rdi + 0x80], rax", // rip
+        "mov rax, [rsp + 0x80]", "mov [rdi + 0x88], rax", // cs
+        "mov rax, [rsp + 0x88]", "mov [rdi + 0x90], rax", // rflags
+        "mov rax, {magic_const}", "mov [rdi + 0x98], rax", // magic
+        // --- 3. Common EOI + exact same-task restore. ---
+        "2:",
         "mov rax, [rip + {eoi_base}]",
         "test rax, rax",
-        "jz 2f",
+        "jz 3f",
         "mov dword ptr [rax], 0",
-        "2:",
+        "3:",
+        "pop rax", "pop rcx", "pop rdx", "pop rbx",
+        "pop rbp", "pop rsi", "pop rdi", "pop r8",
+        "pop r9", "pop r10", "pop r11", "pop r12",
+        "pop r13", "pop r14", "pop r15",
         "iretq",
-        flag = sym PREEMPTIBLE_BYTE,
+        fence = sym PREEMPTIBLE,
+        cur_idx = sym CURRENT_IDX,
+        frames = sym TASK_FRAMES,
         eoi_base = sym EOI_BASE,
+        magic_const = const PREEMPT_MAGIC,
+        max_tasks = const MAX_TASKS,
+        apic_ticks = sym crate::idt::APIC_TICKS,
+        switches = sym PREEMPT_SWITCHES,
     )
 }
 
 /// LAPIC EOI register address, set once by `apic::init` (base + 0xB0).
-/// Zero until then — the stub is not installed before the table commit, so a
-/// zero base can only mean "don't touch the MMIO", tested with `jz`.
-/// `static mut` (same `.rodata` trap as [`PREEMPTIBLE_BYTE`]): written once
-/// during bring-up, read by the stub with IF=0.
+/// Zero means "don't touch the MMIO" — the stub tests it with `jz`, so the
+/// handler is harmless even before the APIC is mapped.
+/// `static mut` (same `.rodata` trap as [`PREEMPTIBLE`]): written once during
+/// bring-up, read by the stub with IF=0.
 pub static mut EOI_BASE: u64 = 0;
 
 /// Publish the EOI address to the stub. Called once by `apic::init`.

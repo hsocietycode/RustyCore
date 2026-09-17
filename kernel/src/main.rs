@@ -230,21 +230,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             core::hint::spin_loop();
         }
     }
-    // Phase 3, Step 2b: tasks run ON their own stacks via a real naked-asm
-    // switch. Three demo tasks yield through the round-robin scheduler — the
-    // log shows the interleave, each stack top + ctx.rsp is printed at spawn,
-    // rsp0 is updated on every switch, and every QUANTUM_TICKS-th LAPIC tick
-    // raises a preempt point that the driver observes and logs. Still
-    // cooperative (the driver paces on LAPIC ticks, tasks yield by returning
-    // into the trampoline) — the full yank-mid-step lands later this step.
-    // Step 4 proof block (runs BEFORE the demo): the naked stub must assemble
-    // and its fence must be DOWN on the boot stack (nobody set it — no task
-    // runs yet), the EOI base must be published (apic::init ran), and every
-    // spawned task's preempt frame must validate (fresh-frame proof).
+    // Phase 3, Step 2b/4: tasks run ON their own stacks via a real naked-asm
+    // switch, AND the LAPIC 0xEF vector is a naked preempt stub that yanks a
+    // running task mid-step (saving its full frame) and resumes it where it
+    // was. The demo logs the interleave, each stack top + ctx.rsp at spawn,
+    // rsp0 per switch, and every real yank with its tick.
+    // Step 4 proof block (runs BEFORE the demo): the fence must be DOWN on
+    // the boot stack (nobody set it — no task runs yet), the EOI base must be
+    // published (apic::init ran), and the stub address must be non-null.
     {
         use core::sync::atomic::Ordering;
-        let fence =
-            unsafe { core::ptr::read_volatile(&raw const crate::preempt::PREEMPTIBLE_BYTE) };
+        let fence = crate::preempt::PREEMPTIBLE.load(Ordering::Relaxed);
         assert_eq!(
             fence, 0,
             "preempt fence UP on boot stack — trampoline leaked it"
@@ -300,6 +296,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             let step = move || {
                 n += 1;
                 crate::serial_println!("task {}/{} step {}", id, tag, n);
+                // Step 4 yank witness: keep the FIRST step inside the
+                // fence-up window until a fresh LAPIC tick arrives. The naked
+                // 0xEF stub must interrupt this loop, save all 15 GPRs + the
+                // HW frame, EOI, restore, and resume EXACTLY here. If any
+                // register or frame offset is wrong, we never reach step 2.
+                if n == 1 {
+                    let before = crate::idt::APIC_TICKS.load(Ordering::Relaxed);
+                    while crate::idt::APIC_TICKS.load(Ordering::Relaxed) == before {
+                        core::hint::spin_loop();
+                    }
+                }
                 n < SCHED_FAIR_RUNS
             };
             #[cfg(feature = "sched-rr")]
@@ -346,15 +353,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let mut schedules: u64 = 0;
         let mut asleep_passes: u64 = 0;
         let mut preempts: u64 = 0;
-        // Drain any quantum flag raised before the demo started (soak +
-        // promotion watch ticked ~200 times with nobody observing) — the
-        // first logged preempt point must come from THIS loop, not stale.
-        crate::task::take_preempt_flag();
+        // Step 4: the naked stub bumps PREEMPT_SWITCHES every time it yanks a
+        // running task (fence up). The driver reads the DELTA after each
+        // schedule — a rising counter means the stub fired mid-step and the
+        // task RESUMED cleanly (a corrupt frame would have triple-faulted
+        // long before we got here). Baseline = switches seen so far.
+        let mut last_switches =
+            crate::preempt::PREEMPT_SWITCHES.load(core::sync::atomic::Ordering::Relaxed);
         // Pace the demo on real LAPIC ticks: wait for a FRESH tick before
-        // every schedule. 16 schedules then span ~16 ticks > QUANTUM_TICKS,
-        // so quanta expire MID-demo and preempt points interleave with task
-        // steps instead of landing after the finish lines. IF=1 here
-        // (enabled before calibrate, never disabled).
+        // every schedule. IF=1 here (enabled before calibrate, never
+        // disabled). The stub runs during the hlt too (fence down → just
+        // ticks+EOI+iretq, no yank) — so APIC_TICKS keeps climbing.
         let mut last_tick = crate::idt::APIC_TICKS.load(Ordering::Relaxed);
         while sched.alive() > 0 {
             // Wait for the next LAPIC tick (hlt-sleep; the LAPIC is live).
@@ -378,15 +387,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
             }
             asleep_passes = 0;
             schedules += 1;
-            // Step 2b proof: the handler raised NEED_RESCHED during this
-            // pass — a quantum expired, the policy noticed. Log it loudly.
-            if crate::task::take_preempt_flag() {
+            // Step 4 proof: did the stub yank this task mid-step? A rising
+            // switch count = the timer fired on a preemptible task AND the
+            // resume worked (we're still here, the ledger is still fair).
+            let switches =
+                crate::preempt::PREEMPT_SWITCHES.load(core::sync::atomic::Ordering::Relaxed);
+            if switches != last_switches {
                 preempts += 1;
                 serial_println!(
-                    "sched: preempt point {} at apic tick ~{}",
+                    "sched: preempt yank {} (switches {}→{}) at apic tick ~{}",
                     preempts,
+                    last_switches,
+                    switches,
                     crate::idt::APIC_TICKS.load(Ordering::Relaxed)
                 );
+                last_switches = switches;
             }
             if schedules > SCHED_RUNAWAY_GUARD {
                 serial_println!(
@@ -398,11 +413,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 }
             }
         }
-        // Step 2b gate: at least one quantum must have expired mid-demo.
-        // Zero preempt points means the timer→policy path is dead (flag
-        // never raised, or never observed) — say so loudly, not silently.
+        // Step 4 gate: at least one yank must have landed on a preemptible
+        // task and resumed cleanly. Zero means the stub never fired mid-step
+        // (fence never up during a tick, or the timer→stub path is dead) —
+        // say so loudly, not silently.
         if preempts == 0 {
-            serial_println!("sched FAILED: preemption clock silent (0 quanta in demo). Halting.");
+            serial_println!("sched FAILED: preemption stub silent (0 yanks in demo). Halting.");
             loop {
                 x86_64::instructions::hlt();
             }

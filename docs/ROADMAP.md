@@ -30,9 +30,11 @@
 
 ## Phase 3 — Process (v0.4)
 - [x] Step 1: `trait Scheduler` + `sched-rr` (cooperative, all-asleep fix, napper witness)
-- [x] Step 2a: per-task `TaskStack` (128K heap-backed, 16B-aligned top) + preemption clock (`timer_tick` from LAPIC handler, `NEED_RESCHED` every 10 ticks, preempt points interleaved in demo log)
-- [x] Step 2b: real context switch (`#[unsafe(naked)]` save/restore callee-saved + RSP, fake-frame bootstrap, `task_trampoline`, `Box<Task>` queue, `TSS.rsp0` proof-of-path, stack canary, `-C no-redzone=yes`) — boot proof: interleaved steps on own stacks, rsp0 per switch, 2 preempt points, ledger 5-5-5-1
-- [x] `sched-cfs` policy behind the same trait (min-vruntime pick, weight-proportional accrual, sleeper floor clamp; gamma@2048 finishes first — QEMU boot proof)
+- [x] Step 2a: per-task `TaskStack` (128K heap-backed, 16B-aligned top) + timer clock
+- [x] Step 2b: real context switch (`#[unsafe(naked)]` save/restore callee-saved + RSP, fake-frame bootstrap, `task_trampoline`, `Box<Task>` queue, `TSS.rsp0` proof-of-path, stack canary, `-C no-redzone=yes`) — boot proof: interleaved steps on own stacks, rsp0 per switch, ledger 5-5-5-1
+- [x] Step 3: `sched-cfs` policy behind the same trait (min-vruntime pick, weight-proportional accrual, sleeper floor clamp; gamma@2048 finishes first — QEMU boot proof)
+- [x] Step 4: preemptive switch-from-IRQ — LAPIC 0xEF entry is a `#[unsafe(naked)]` stub (interrupt gate, DPL0), `PREEMPTIBLE` fence, static `TASK_FRAMES` table (index-addressed, no alloc in IRQ), `FullFrame` (15 GPRs + hw rip/cs/rflags + pre-IRQ rsp + magic, 160B, layout-locked by `const _`), `lock inc` tick/yank counters — boot proof: 3 real yanks, each resumed exactly, IRQ-stashed frame validated per task, ledger 5-5-5-1
+- [ ] Step 5: cross-task yank (resume a DIFFERENT task's frame — explicit `mov rsp, [frame.rsp]`, retires the cooperative driver)
 - [ ] User mode ring3 + ELF loader
 - [ ] RAMFS → FAT32
 
