@@ -203,7 +203,16 @@ pub static PREEMPTIBLE: AtomicU8 = AtomicU8::new(0);
 /// napper) plus headroom — a real growable table is a later step (today the
 /// driver spawns a fixed set, so a fixed array is honest, not a limitation
 /// worth a dynamic allocator in IRQ context).
-pub const MAX_TASKS: usize = 8;
+///
+/// This is an UPPER BOUND, and it is the table's size, not a promise that
+/// this many tasks can run: the real ceiling is [`crate::task`]'s
+/// `STACK_ALLOC_BYTES` × this against `memory::HEAP_SIZE`, checked at compile
+/// time. With the shipped config (`stack_size = "128K"`, `heap_size_kb =
+/// 1024`) eight slots would need 1 048 704 B of a 1 048 576 B heap — 128
+/// bytes short — so the effective limit is SEVEN and the eighth spawn dies
+/// in an allocation panic. The const assert in `task.rs` is what keeps this
+/// comment true; if it ever fires, one of the three numbers has to move.
+pub const MAX_TASKS: usize = 7;
 
 /// Words in the SW spill (15 GPRs) — the stub and the layout assert share this.
 const SPILL_WORDS: usize = 15;
@@ -248,8 +257,11 @@ pub static CURRENT_IDX: AtomicU8 = AtomicU8::new(MAX_TASKS as u8);
 /// Slot occupancy bitmap: bit `i` set ⇔ `TASK_FRAMES[i]` holds a live task.
 /// A bitmap (not a count) because slots are released individually when a task
 /// finishes — a finish order of 1,3,2 leaves holes, and "index < count" would
-/// happily accept a freed slot. `u8` covers [`MAX_TASKS`] = 8 exactly; the
-/// stub tests the bit with a single `bt`, no lock (single CPU, IF=0).
+/// happily accept a freed slot. A `u8` bitmap holds up to 8 slots, so it
+/// still covers [`MAX_TASKS`] with one bit to spare; the stub tests the bit
+/// with a single `bt`, no lock (single CPU, IF=0). Raising `MAX_TASKS` past 8
+/// therefore means widening this to `u16` AND the stub's `movzx ecx`+`bt`
+/// pair with it — the two are one decision, not two.
 pub static SLOT_USED: AtomicU8 = AtomicU8::new(0);
 
 /// Flip the fence. Called by the trampoline only (IF=0 at both flip points —

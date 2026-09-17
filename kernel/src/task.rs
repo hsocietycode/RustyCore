@@ -400,6 +400,46 @@ pub const STACK_CANARY: u64 = 0xDEAD_BEEF_CAFE_F00D;
 /// value everything above here reasons about.
 const STACK_ALIGN: u64 = 16;
 
+/// Bytes one task stack actually consumes from the kernel heap — the exact
+/// size [`TaskStack::new`] asks the allocator for. Single definition so the
+/// capacity check below and the allocation can never drift apart.
+const STACK_ALLOC_BYTES: usize = STACK_SIZE_BYTES + STACK_ALIGN as usize;
+
+/// Capacity check, enforced at COMPILE time: the preempt table may only
+/// advertise as many task slots as the kernel heap can physically back with
+/// stacks. Both limits are read from `config/kernel_config.toml` through
+/// `const fn` parsers (`STACK_SIZE_BYTES` here, `HEAP_SIZE` in `memory`), so
+/// the numbers are the real ones, not literals next to a comment.
+///
+/// Why this exists rather than a comment: `MAX_TASKS` is the table the
+/// PREEMPT STUB indexes, while the stack size is what actually decides how
+/// many tasks can exist. Nothing tied the two together, and they disagreed —
+/// 8 slots × 131 088 B = 1 048 704 B against a 1 048 576 B heap, so the
+/// eighth task was 128 bytes short and died in
+/// `memory allocation of 131088 bytes failed`. The table promised eight
+/// slots while the heap could only ever back seven, and only the eighth
+/// spawn found out, at run time, in a panic.
+///
+/// That is the same failure mode `build.rs` already refuses for
+/// `frame_allocator` and `[sched] default`: a configuration file must not be
+/// able to describe a kernel that cannot boot. Here the compiler is the
+/// enforcer — the build stops and names the offending pair instead of
+/// shipping a capacity that only exists on paper.
+///
+/// Also note the heap must hold four LIVE stacks plus one under construction
+/// at any moment (spawn allocates before the previous boxes are freed, and
+/// `Box<Task>` metadata plus the free-list bookkeeping live in the same
+/// megabyte), so `MAX_TASKS` is a hard upper bound, not a recommended one.
+///
+/// The fix when this fires is a choice, never a shrug: raise `heap_size_kb`,
+/// or lower `stack_size`, or lower `MAX_TASKS` — one of the three numbers
+/// moves, and the config still has to say which.
+const _: () = assert!(
+    crate::preempt::MAX_TASKS * STACK_ALLOC_BYTES <= crate::memory::HEAP_SIZE,
+    "MAX_TASKS stacks do not fit in the kernel heap: lower MAX_TASKS, \
+     or raise [memory] heap_size_kb, or lower [memory] stack_size"
+);
+
 impl TaskStack {
     /// Allocate a fresh stack. Panics loudly on OOM — a task without a
     /// stack is not a task, and booting past it would corrupt memory.
@@ -417,8 +457,7 @@ impl TaskStack {
     /// mood, and every address this struct hands out is 16-aligned.
     pub fn new() -> Self {
         use alloc::vec;
-        let backing: alloc::boxed::Box<[u8]> =
-            vec![0u8; STACK_SIZE_BYTES + STACK_ALIGN as usize].into_boxed_slice();
+        let backing: alloc::boxed::Box<[u8]> = vec![0u8; STACK_ALLOC_BYTES].into_boxed_slice();
         let raw = backing.as_ptr() as u64;
         // Align the bottom UP, leaving top = bottom + STACK_SIZE_BYTES, which
         // is 16-aligned too because STACK_SIZE_BYTES is a multiple of 16.

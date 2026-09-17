@@ -21,11 +21,12 @@ RustyCore v0.2 - IDT loaded (exceptions + IRQ vectors live).
 RustyCore v0.2 - PIC remapped to 32..=47, all masked.
 apic: probe present=true base=0xfee00000 enabled=true bsp=true rsdp=yes; base=msr
 memory: 504 MiB usable in 3 regions, heap 1024 KiB at 0xffff900000000000, phys offset 0xffff800000000000 (frames: buddy)
-memory: buddy self-test ok (free 128846 frames, alloc+free round-trips, allocated=259)
+memory: buddy self-test ok (free 128841 frames, alloc+free round-trips, allocated=259)
 apic: mapped + enabled id=0 ver=0x50014 svr=0x1ff
 apic-timer: calibrate rounds=[6205998 6243191 6253336] median=6243191
+self-test: syscall stub ok (2 hits).
 apic-timer: promoted to master clock (PIC IRQ0 masked, IRQ1 kept)
-self-test: LAPIC master proven (apic +100 like the gate, pic frozen at 132).
+self-test: LAPIC master proven (apic +100 like the gate, pic frozen at 131).
 preempt: fence=down eoi-base=0xffffa000000000b0 stub=0x1000000dc24 switches=0 (proof block ok)
 sched: task 1/alpha stack top 0xffff900000020320 (128 KiB) ctx.rsp=... preempt rip=... slot=0
 sched: preempt yank 1 (switches 0->1) at apic tick ~...
@@ -33,8 +34,12 @@ sched ledger: task 1/alpha runs=5
 sched: round-robin fair (3x5 + napperx1). Phase 3 online. Halting.
 ```
 
-Per-phase status lives in [`docs/ROADMAP.md`](docs/ROADMAP.md); the log above
-is the gate CI greps for (`Phase [23] online`).
+Per-phase status lives in [`docs/ROADMAP.md`](docs/ROADMAP.md). The last line
+is the CI gate: `Phase 3 online` is printed only on the healthy path, and the
+run is also required to show at least one `sched: preempt yank` — a boot
+where the LAPIC stub never yanked a running task is a regression, not a pass.
+(Note that `Phase 2 online` is deliberately NOT part of the gate: it is
+emitted only by the two degraded fallback branches, never by a good boot.)
 
 ## Prereqs
 

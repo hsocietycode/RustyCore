@@ -26,10 +26,23 @@ jobs:
         run: cargo xtask image
       - name: QEMU boot smoke test
         # The kernel halts in an hlt-loop, so QEMU never exits on its own —
-        # `timeout` kills it, and the serial log is the gate: no
-        # "Phase 2 online" line means the boot regressed, fail the job.
-        # (No KVM on Actions runners; TCG emulation is slower but works.)
+        # `timeout` kills it, and the serial log is the gate.
+        #
+        # Gate on "Phase 3 online": that line is printed by the scheduler on
+        # the HEALTHY path only (after the ledger proves fairness), so it is
+        # the last thing a correct boot says. It implies every earlier gate
+        # passed — memory, syscall stub, LAPIC promotion, the preempt yanks.
+        #
+        # Do NOT gate on "Phase 2 online": the healthy path never prints it.
+        # It exists only in two degraded branches (promotion skipped, or the
+        # LAPIC stalling after promotion), so a grep for it would pass on a
+        # broken boot and fail on a good one.
+        #
+        # The preempt yank line is checked separately below as a loud
+        # regression marker: Step 4's whole point is that the naked 0xEF stub
+        # yanks a running task mid-step, and zero yanks must fail the job.
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq qemu-system-x86
           timeout 150 cargo xtask run-qemu > boot.log 2>&1 || true
-          grep -aE "Phase [23] online" boot.log
+          grep -aE "Phase 3 online" boot.log
+          grep -aE "sched: preempt yank [1-9]" boot.log
