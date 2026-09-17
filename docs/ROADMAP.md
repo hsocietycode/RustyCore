@@ -34,7 +34,8 @@
 - [x] Step 2b: real context switch (`#[unsafe(naked)]` save/restore callee-saved + RSP, fake-frame bootstrap, `task_trampoline`, `Box<Task>` queue, `TSS.rsp0` proof-of-path, stack canary, `-C no-redzone=yes`) — boot proof: interleaved steps on own stacks, rsp0 per switch, ledger 5-5-5-1
 - [x] Step 3: `sched-cfs` policy behind the same trait (min-vruntime pick, weight-proportional accrual, sleeper floor clamp; gamma@2048 finishes first — QEMU boot proof)
 - [x] Step 4: preemptive switch-from-IRQ — LAPIC 0xEF entry is a `#[unsafe(naked)]` stub (interrupt gate, DPL0), `PREEMPTIBLE` fence, static `TASK_FRAMES` table (index-addressed, no alloc in IRQ), `FullFrame` (15 GPRs + hw rip/cs/rflags + pre-IRQ rsp + magic, 160B, layout-locked by `const _`), `lock inc` tick/yank counters — boot proof: 3 real yanks, each resumed exactly, IRQ-stashed frame validated per task, ledger 5-5-5-1
-- [ ] Step 5: cross-task yank (resume a DIFFERENT task's frame — explicit `mov rsp, [frame.rsp]`, retires the cooperative driver)
+- [x] Step 5a: slot identity — `TASK_PTRS` (slot → task, stable box address, cleared before the drop), `SLOT_BOUNDS` (per-slot stack window for IRQ-side validation), trampoline resolves itself by slot (cached `CURRENT_TASK` pointer deleted), `frame_ok` checks the table rather than the task
+- [ ] Step 5b: cross-task yank — retire the cooperative `Context` (one resume path through `iretq`), explicit `mov rsp, [frame.rsp]`, `main` becomes a task instead of a driver. Design notes: [`docs/preemption.md`](preemption.md)
 - [ ] User mode ring3 + ELF loader
 - [ ] RAMFS → FAT32
 
