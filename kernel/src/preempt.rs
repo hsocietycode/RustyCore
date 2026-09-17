@@ -203,6 +203,13 @@ const FRAME_STRIDE: u64 = core::mem::size_of::<FullFrame>() as u64;
 /// in place. `FullFrame` is `repr(C)` so field offsets are stable for asm.
 pub static mut TASK_FRAMES: [FullFrame; MAX_TASKS] = [const { FullFrame::ZERO }; MAX_TASKS];
 
+/// Per-slot kernel-stack window `(bottom, top)`, filled by [`register_task`].
+/// The IRQ path needs these to decide whether a frame is safe to `iretq` into
+/// — a cross-task switch jumps to a stack this code never touched, so the
+/// bounds check is the difference between "resume somebody" and "triple fault
+/// with no log". `(0, 0)` for a free slot.
+static mut SLOT_BOUNDS: [(u64, u64); MAX_TASKS] = [(0, 0); MAX_TASKS];
+
 /// How many times the stub actually switched tasks (IRQ-side counter, read by
 /// the driver for the boot log — the stub itself never prints).
 pub static PREEMPT_SWITCHES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -239,6 +246,11 @@ pub fn register_task(idx: usize, frame: FullFrame) {
         SLOT_USED.load(Ordering::Relaxed) & (1 << idx) == 0,
         "preempt: slot {idx} registered twice — slot accounting is broken"
     );
+    // NOTE: no rsp sanity check here. Kernel stacks live in the high half
+    // (0xFFFF_9000_...), so any bound picked here would either admit nothing
+    // or prove nothing — the real check is `valid_for(bottom, top)` against
+    // the window recorded by `set_slot_bounds`, which is where the frame is
+    // actually consumed.
     unsafe {
         core::ptr::addr_of_mut!(TASK_FRAMES)
             .cast::<FullFrame>()
@@ -246,6 +258,43 @@ pub fn register_task(idx: usize, frame: FullFrame) {
             .write(frame);
     }
     SLOT_USED.fetch_or(1 << idx, Ordering::Relaxed);
+}
+
+/// Record the stack window a slot's frame belongs to. Split from
+/// [`register_task`] because the bounds come from [`TaskStack`](crate::task)
+/// (the frame itself carries no bottom/top), and keeping the two facts
+/// together at the call site is what makes the IRQ-side check honest.
+pub fn set_slot_bounds(idx: usize, bottom: u64, top: u64) {
+    assert!(idx < MAX_TASKS, "preempt: bounds slot overflow");
+    assert!(bottom < top, "preempt: empty stack window for slot {idx}");
+    unsafe {
+        SLOT_BOUNDS[idx] = (bottom, top);
+    }
+}
+
+/// Stack window recorded for a slot (or `None` if the slot is free).
+pub fn slot_bounds(idx: usize) -> Option<(u64, u64)> {
+    if idx >= MAX_TASKS {
+        return None;
+    }
+    // SAFETY: single CPU; the driver writes only with IF=0 and the IRQ path
+    // reads only while the fence is down or for a slot it is switching away
+    // from. A 16-byte aligned pair of u64s cannot tear.
+    let b = unsafe { SLOT_BOUNDS[idx] };
+    (b.0 != 0).then_some(b)
+}
+
+/// Does the frame in slot `idx` look safe to `iretq` into? Magic intact,
+/// rsp inside the slot's recorded window. The IRQ path's only guard against
+/// jumping into a freed or half-written stack.
+pub fn frame_ok(idx: usize) -> bool {
+    match slot_bounds(idx) {
+        Some((bottom, top)) => {
+            let f = snapshot(idx);
+            f.valid_for(bottom, top)
+        }
+        None => false,
+    }
 }
 
 /// Release a task's slot when it finishes. Clears the occupancy bit and
@@ -274,6 +323,14 @@ pub fn unregister_task(idx: usize) {
 /// boot stack.
 pub fn set_current(idx: usize) {
     CURRENT_IDX.store(idx as u8, Ordering::Relaxed);
+}
+
+/// Which slot is running right now. The trampoline resolves its own `Task`
+/// through this rather than through a cached pointer: after an IRQ-driven
+/// switch the cached pointer would name the task that was yanked OUT, while
+/// the slot always names the task whose stack is under our feet.
+pub fn current_idx() -> usize {
+    CURRENT_IDX.load(Ordering::Relaxed) as usize
 }
 
 /// Snapshot an IRQ-saved frame after the task has yielded back to the driver.

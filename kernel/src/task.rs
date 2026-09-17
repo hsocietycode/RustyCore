@@ -94,19 +94,6 @@ impl Context {
 /// only by the trampoline — single CPU, cooperative, no race.
 static mut SCHED_CTX: Context = Context::empty();
 
-/// The task currently executing on its own stack (null while the driver
-/// runs on the boot stack). Set by the driver just before switching in,
-/// read by the trampoline to find whose step to run. Raw pointer, not a
-/// reference — no borrow crosses the `asm!` boundary, ever.
-///
-/// Lifetime protocol: the pointer is valid only while its `Box<Task>` is
-/// alive in the driver's hand. A finished task's Box is dropped at the end
-/// of the `schedule_once` iteration, leaving this dangling — but nobody
-/// reads it in that window: the trampoline reads it ONLY right after a
-/// switch that the driver set up, and every switch sets it fresh first.
-/// Single CPU + cooperative = no preemptive reader can slip between.
-static mut CURRENT_TASK: *mut Task = core::ptr::null_mut();
-
 /// Naked context switch: save callee-saved + RSP into `*old`, load them
 /// from `*new`, `ret` into the new side.
 ///
@@ -205,7 +192,7 @@ fn init_task_context(top: u64) -> Context {
 /// First-run (and every-run) entry point on a task's own stack.
 ///
 /// Reached by `ret` from [`context_switch`] with RSP = task top. Finds the
-/// current task via `CURRENT_TASK`, enables interrupts (the driver disabled
+/// current task via its slot, enables interrupts (the driver disabled
 /// them around the switch — IRQ time must never see half-switched stacks),
 /// runs ONE step, disables interrupts again, and switches back to the
 /// scheduler. When the step returns `false` the task is marked finished —
@@ -232,6 +219,71 @@ extern "C" fn task_trampoline() -> ! {
     )
 }
 
+/// Slot → task pointer. The trampoline resolves "which task owns the stack I
+/// am standing on" from the SLOT the stub published, never from a cached
+/// pointer: after an IRQ-driven cross-task switch, any pointer captured
+/// before the switch describes the task that was yanked OUT, not the one now
+/// running.
+///
+/// Lifetime: the driver owns each `Box<Task>` while it is queued, and the box
+/// POINTER (`*mut Task`) stays valid across `VecDeque` moves — only the Box
+/// handle moves, never the `Task` it owns. `unregister` clears the entry in
+/// the same breath as the slot bit, so a retired task can never be re-found.
+static mut TASK_PTRS: [*mut Task; crate::preempt::MAX_TASKS] =
+    [core::ptr::null_mut(); crate::preempt::MAX_TASKS];
+
+/// Find the live task occupying slot `idx`.
+pub fn task_at(idx: usize) -> Option<&'static mut Task> {
+    if idx >= crate::preempt::MAX_TASKS {
+        return None;
+    }
+    // SAFETY: single CPU. The pointer is written by the driver with IF=0 and
+    // read here while the fence is down (or by the trampoline, which is the
+    // task itself). `unregister` clears it before the Box is dropped, so a
+    // live entry always points at a live `Task`.
+    let p = unsafe { TASK_PTRS[idx] };
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { &mut *p })
+    }
+}
+
+/// Record which task occupies a slot (called at spawn, before any switch).
+fn set_task_ptr(idx: usize, task: *mut Task) {
+    assert!(
+        idx < crate::preempt::MAX_TASKS,
+        "slot overflow in TASK_PTRS"
+    );
+    unsafe {
+        TASK_PTRS[idx] = task;
+    }
+}
+
+/// Drop the slot's task pointer (called when the task finishes, before the
+/// `Box` is dropped — the order matters: pointer first, memory second).
+fn clear_task_ptr(idx: usize) {
+    if idx < crate::preempt::MAX_TASKS {
+        unsafe {
+            TASK_PTRS[idx] = core::ptr::null_mut();
+        }
+    }
+}
+
+/// Look up the running task by SLOT rather than by a cached pointer.
+///
+/// Slot identity is the whole point: the preempt stub can resume a task this
+/// code never set up, and a pointer cached before an IRQ-driven switch would
+/// then describe the WRONG task (or a dangling `Box`). The table is the
+/// single source of truth for "which task owns the stack I am standing on",
+/// so every trampoline iteration re-resolves it. Panics if the slot is not
+/// registered — that means the stack we are running on has no owner, which is
+/// a bug worth stopping for, not papering over.
+fn current_task() -> &'static mut Task {
+    let idx = crate::preempt::current_idx();
+    task_at(idx).unwrap_or_else(|| panic!("trampoline on stack of unregistered slot {idx}"))
+}
+
 /// The real trampoline body (see [`task_trampoline`] for the entry shim).
 ///
 /// Entered by `jmp` with the same RSP the shim captured — so this function's
@@ -240,54 +292,54 @@ extern "C" fn task_trampoline() -> ! {
 /// that fabricates a function-entry state out of thin air, and getting it
 /// wrong is silent until some unrelated task declares an `f64`.
 extern "C" fn task_trampoline_body() -> ! {
-    unsafe {
-        let entry_rsp = core::ptr::read_volatile(&raw const TRAMPOLINE_ENTRY_RSP);
-        assert_eq!(
-            entry_rsp % 16,
-            8,
-            "ABI violation: task entered with rsp%16 == {} (must be 8) — \
-             the bootstrap frame's alignment math is wrong",
-            entry_rsp % 16
-        );
-        let task = &mut *CURRENT_TASK;
-        // Resume lands HERE (after the yield-switch below), not at function
-        // top: the loop re-runs the next step on every re-entry. First entry
-        // arrives via the bootstrap's fake `ret`; every later entry arrives
-        // via `context_switch` returning into the previous iteration's yield.
-        loop {
-            // Overflow tripwire FIRST: if the stack grew into its own
-            // bottom, the canary is gone — halt before heap corruption.
-            if !task.stack.canary_ok() {
-                x86_64::instructions::interrupts::disable();
-                crate::serial_println!(
-                    "sched FAILED: task {}/{} stack overflow (canary trashed)",
-                    task.id,
-                    task.name
-                );
-                loop {
-                    x86_64::instructions::hlt();
-                }
-            }
-            // IRQs back on: we are on a real task stack now, handlers run.
-            // Fence UP: from here until the yield `cli` below, the CPU is on
-            // a task stack with IF=1 — the preempt stub may yank us mid-step.
-            // (Set AFTER sti: a tick in the 2-instruction window sees
-            // fence=false and defers one quantum — correct, not lost.)
-            x86_64::instructions::interrupts::enable();
-            crate::preempt::set_preemptible(true);
-            let alive = (task.step)();
-            task.runs += 1;
-            task.state = if alive {
-                TaskState::Ready
-            } else {
-                TaskState::Finished
-            };
-            // Fence DOWN first, then IRQs off: from here the stack is
-            // half-switch territory — IRQ time must not touch it.
-            crate::preempt::set_preemptible(false);
-            // IRQs off before switching stacks — IRQ time must never see a
-            // half-switched RSP.
+    let entry_rsp = unsafe { core::ptr::read_volatile(&raw const TRAMPOLINE_ENTRY_RSP) };
+    assert_eq!(
+        entry_rsp % 16,
+        8,
+        "ABI violation: task entered with rsp%16 == {} (must be 8) — \
+         the bootstrap frame's alignment math is wrong",
+        entry_rsp % 16
+    );
+    // Resume lands HERE (after the yield-switch below), not at function
+    // top: the loop re-runs the next step on every re-entry. First entry
+    // arrives via the bootstrap's fake `ret`; every later entry arrives
+    // via `context_switch` returning into the previous iteration's yield.
+    loop {
+        let task = current_task();
+        // Overflow tripwire FIRST: if the stack grew into its own
+        // bottom, the canary is gone — halt before heap corruption.
+        if !task.stack.canary_ok() {
             x86_64::instructions::interrupts::disable();
+            crate::serial_println!(
+                "sched FAILED: task {}/{} stack overflow (canary trashed)",
+                task.id,
+                task.name
+            );
+            loop {
+                x86_64::instructions::hlt();
+            }
+        }
+        // IRQs back on: we are on a real task stack now, handlers run.
+        // Fence UP: from here until the yield `cli` below, the CPU is on
+        // a task stack with IF=1 — the preempt stub may yank us mid-step.
+        // (Set AFTER sti: a tick in the 2-instruction window sees
+        // fence=false and defers one quantum — correct, not lost.)
+        x86_64::instructions::interrupts::enable();
+        crate::preempt::set_preemptible(true);
+        let alive = (task.step)();
+        task.runs += 1;
+        task.state = if alive {
+            TaskState::Ready
+        } else {
+            TaskState::Finished
+        };
+        // Fence DOWN first, then IRQs off: from here the stack is
+        // half-switch territory — IRQ time must not touch it.
+        crate::preempt::set_preemptible(false);
+        // IRQs off before switching stacks — IRQ time must never see a
+        // half-switched RSP.
+        x86_64::instructions::interrupts::disable();
+        unsafe {
             context_switch(&mut task.ctx as *mut Context, &raw const SCHED_CTX);
         }
     }
@@ -297,15 +349,18 @@ extern "C" fn task_trampoline_body() -> ! {
 ///
 /// Contract: interrupts are disabled by the caller around this call (the
 /// trampoline re-enables on entry, disables before switching back). Sets
-/// `CURRENT_TASK`, updates `TSS.rsp0` to the task's stack top as proof of
-/// the path (no hardware reads it at CPL 0 — ring 3 will), and calls the
-/// naked switch. Returns when the task yields back.
+/// the task's SLOT (the trampoline and the preempt stub both resolve their
+/// task through it — never through a cached pointer, which an IRQ-driven
+/// switch would invalidate), updates `TSS.rsp0` to the task's stack top as
+/// proof of the path (no hardware reads it at CPL 0 — ring 3 will), and calls
+/// the naked switch. Returns when the task yields back.
 unsafe fn switch_to_task(task: *mut Task) {
     unsafe {
-        CURRENT_TASK = task;
         // Publish the preempt-table index so the LAPIC stub knows which slot
-        // to yank THIS task's frame into. Set BEFORE sti (the trampoline
-        // re-sti's) — the stub reads CURRENT_IDX only when the fence is up.
+        // to yank THIS task's frame into, and so the trampoline can resolve
+        // its own `Task` from the stack it was resumed onto. Set BEFORE sti
+        // (the trampoline re-sti's) — the stub reads CURRENT_IDX only while
+        // the fence is up.
         crate::preempt::set_current((*task).slot as usize);
         // rsp0 proof-of-path: updated on EVERY switch, read by hardware only
         // once ring 3 arrives. Today it is bookkeeping with a purpose — the
@@ -519,6 +574,7 @@ impl Task {
         );
         let slot = alloc_slot();
         crate::preempt::register_task(slot as usize, preempt);
+        crate::preempt::set_slot_bounds(slot as usize, stack.bottom, stack.top);
         crate::serial_println!(
             "sched: task {}/{} stack top {:#x} ({} KiB) ctx.rsp={:#x} preempt rip={:#x} slot={}",
             id,
@@ -579,6 +635,7 @@ impl Task {
         );
         let slot = alloc_slot();
         crate::preempt::register_task(slot as usize, preempt);
+        crate::preempt::set_slot_bounds(slot as usize, stack.bottom, stack.top);
         crate::serial_println!(
             "sched: task {}/{} stack top {:#x} ({} KiB) ctx.rsp={:#x} preempt rip={:#x} slot={}",
             id,
@@ -691,7 +748,13 @@ impl Default for RoundRobin {
 impl Scheduler for RoundRobin {
     fn spawn(&mut self, task: Task) {
         crate::serial_println!("sched: spawned task {}/{}", task.id, task.name);
-        self.ready.push_back(Box::new(task));
+        let slot = task.slot as usize;
+        let boxed = Box::new(task);
+        // Register the STABLE box address now — only the Box handle moves
+        // when the queue reallocates, never the `Task` it owns, so the
+        // slot→task pointer stays valid for the task's whole life.
+        set_task_ptr(slot, &*boxed as *const Task as *mut Task);
+        self.ready.push_back(boxed);
     }
 
     fn next_id(&mut self) -> usize {
@@ -708,7 +771,7 @@ impl Scheduler for RoundRobin {
         // so the caller hlt-waits for the next tick instead of burning CPU.
         //
         // Step 2b: the step runs ON THE TASK'S STACK. Pop the Box (stable
-        // heap address — the trampoline's CURRENT_TASK pointer stays valid),
+        // heap address — the slot→task table entry stays valid),
         // switch in, and read back the state the trampoline set. No lock
         // exists here at all (plain `&mut self` from the driver) — nothing
         // CAN be held across the `asm!`, by construction.
@@ -746,10 +809,13 @@ impl Scheduler for RoundRobin {
                 task.id,
                 task.name,
             );
-            let irq_frame = crate::preempt::snapshot(task.slot as usize);
+            // Validate the IRQ-stashed frame THROUGH THE TABLE (bounds
+            // recorded at spawn), not through the task's own fields: the
+            // table is what the stub reads, so checking the task instead
+            // would validate a different fact than the one that matters.
             assert!(
-                irq_frame.valid_for(task.stack.bottom, task.stack.top),
-                "task {}/{} IRQ-stashed frame invalid",
+                crate::preempt::frame_ok(task.slot as usize),
+                "task {}/{} IRQ-stashed frame invalid or unregistered",
                 task.id,
                 task.name,
             );
@@ -762,9 +828,11 @@ impl Scheduler for RoundRobin {
                     task.name,
                     task.runs
                 );
-                // Release the preempt-table slot NOW: the frame is wiped to
-                // its invalid template so a stray yank (or a later snapshot)
-                // can never read a rip pointing at this task's freed stack.
+                // Release the preempt-table slot NOW: the pointer goes first
+                // (so the trampoline can no longer find this task), then the
+                // frame is wiped to its invalid template. A stray yank or a
+                // later snapshot can never read a rip into the freed stack.
+                clear_task_ptr(task.slot as usize);
                 crate::preempt::unregister_task(task.slot as usize);
                 self.finished_runs.push((task.id, task.name, task.runs));
             }
@@ -868,7 +936,10 @@ impl Scheduler for Cfs {
             task.name,
             task.weight
         );
-        self.ready.push_back(Box::new(task));
+        let slot = task.slot as usize;
+        let boxed = Box::new(task);
+        set_task_ptr(slot, &*boxed as *const Task as *mut Task);
+        self.ready.push_back(boxed);
     }
 
     fn next_id(&mut self) -> usize {
@@ -906,10 +977,10 @@ impl Scheduler for Cfs {
             task.id,
             task.name,
         );
-        let irq_frame = crate::preempt::snapshot(task.slot as usize);
+        // Same table-side validation as RR (see the comment there).
         assert!(
-            irq_frame.valid_for(task.stack.bottom, task.stack.top),
-            "task {}/{} IRQ-stashed frame invalid",
+            crate::preempt::frame_ok(task.slot as usize),
+            "task {}/{} IRQ-stashed frame invalid or unregistered",
             task.id,
             task.name,
         );
@@ -933,8 +1004,10 @@ impl Scheduler for Cfs {
                 task.runs,
                 task.vruntime
             );
-            // Same slot release as RR: wipe the frame before the Box (and
-            // with it the stack) is dropped — no stale rip survives.
+            // Same slot release as RR: pointer first, then the frame —
+            // both before the Box (and with it the stack) is dropped, so no
+            // stale rip and no dangling task pointer survive.
+            clear_task_ptr(task.slot as usize);
             crate::preempt::unregister_task(task.slot as usize);
             self.finished_runs.push((task.id, task.name, task.runs));
         }
