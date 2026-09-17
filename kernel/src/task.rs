@@ -395,24 +395,51 @@ pub struct TaskStack {
 /// cheap sentinel is the overflow detector (safety-review mitigation).
 pub const STACK_CANARY: u64 = 0xDEAD_BEEF_CAFE_F00D;
 
+/// Alignment forced on the usable stack window. 16 = the SysV ABI's stack
+/// alignment requirement (`rsp % 16 == 8` at a function entry), which is the
+/// value everything above here reasons about.
+const STACK_ALIGN: u64 = 16;
+
 impl TaskStack {
     /// Allocate a fresh stack. Panics loudly on OOM — a task without a
     /// stack is not a task, and booting past it would corrupt memory.
     /// Plants the [`STACK_CANARY`] at the bottom slot.
+    ///
+    /// The allocation is deliberately `STACK_SIZE_BYTES + STACK_ALIGN` long
+    /// and the usable window is aligned UP inside it. The reason is not
+    /// cosmetic: `vec![0u8; N]` has a layout of align 1, so the allocator is
+    /// only obliged to hand back a byte-aligned pointer, and BOTH ends of
+    /// this window are accessed as `u64` (the canary at the bottom, the RSP
+    /// the switch path loads at the top). Writing a `u64` through an
+    /// unaligned pointer is UB — silently fine on x86, and precisely the
+    /// kind of "works until it doesn't" the rest of this file argues
+    /// against. So we own the alignment instead of trusting the allocator's
+    /// mood, and every address this struct hands out is 16-aligned.
     pub fn new() -> Self {
         use alloc::vec;
-        let backing: alloc::boxed::Box<[u8]> = vec![0u8; STACK_SIZE_BYTES].into_boxed_slice();
-        let bottom = backing.as_ptr() as u64;
-        // Top aligned down to 16 — Vec backing is already aligned, but
-        // assert the contract instead of assuming the allocator.
-        let top = (bottom + STACK_SIZE_BYTES as u64) & !0xF;
-        assert!(
-            top > bottom,
-            "task stack top underflowed bottom — size misconfigured?"
+        let backing: alloc::boxed::Box<[u8]> =
+            vec![0u8; STACK_SIZE_BYTES + STACK_ALIGN as usize].into_boxed_slice();
+        let raw = backing.as_ptr() as u64;
+        // Align the bottom UP, leaving top = bottom + STACK_SIZE_BYTES, which
+        // is 16-aligned too because STACK_SIZE_BYTES is a multiple of 16.
+        let bottom = raw.next_multiple_of(STACK_ALIGN);
+        let top = bottom + STACK_SIZE_BYTES as u64;
+        assert_eq!(
+            bottom % STACK_ALIGN,
+            0,
+            "stack bottom misaligned after align-up"
         );
-        // Plant the canary BEFORE anyone runs: bottom slot is ours (heap
-        // gave us the whole region), and nothing legitimate writes there —
-        // the bootstrap lives at the top, 128 KiB away.
+        assert_eq!(
+            top % STACK_ALIGN,
+            0,
+            "stack top misaligned — size not a multiple of 16?"
+        );
+        assert!(
+            top <= raw + backing.len() as u64,
+            "aligned stack window escaped its backing allocation"
+        );
+        // Plant the canary BEFORE anyone runs: the bottom slot is ours, and
+        // nothing legitimate writes there — the bootstrap lives at the top.
         unsafe {
             (bottom as *mut u64).write(STACK_CANARY);
         }
@@ -564,7 +591,9 @@ impl Task {
         let stack = TaskStack::new();
         let ctx = init_task_context(stack.top);
         // Fresh preempt frame: rip = trampoline, cs = current code segment,
-        // rsp = stack top. First yank-resume goes through iretq like any other.
+        // rsp = stack top - 8 (ABI parity — `FullFrame::fresh` explains why an
+        // iretq into a task must land at `rsp % 16 == 8`). First yank-resume
+        // goes through iretq like any other.
         let cs = x86_64::instructions::segmentation::CS::get_reg().0;
         let preempt =
             crate::preempt::FullFrame::fresh(task_trampoline as *const () as u64, cs, stack.top);

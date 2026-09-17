@@ -459,8 +459,21 @@ fn panic(info: &PanicInfo) -> ! {
     // scheduler queue (its Box<Task>s may be mid-mutation) or the heap
     // beyond the formatter's stack buffer.
     serial_println!("PANIC: {}", info);
-    // cli before the halt loop: with IF=1 every LAPIC tick would wake the
-    // hlt just to re-halt (wake-spam at 100 Hz). Dead machine stays dead.
+    // A panicked kernel is DEAD — and dead means the interrupt machinery must
+    // stop, not narrate. Two things are wrong by default at panic time:
+    //
+    // 1. IF may be 1 (a panic inside a task step runs with interrupts on), so
+    //    every LAPIC tick would wake the hlt just to re-halt (wake-spam at
+    //    100 Hz) — and worse, the naked 0xEF stub would keep running.
+    // 2. `PREEMPTIBLE` may still be UP (a step panicked before its yield
+    //    lowered the fence), while `CURRENT_IDX` still names the task that
+    //    just died. The stub would then believe it is yanking a live task and
+    //    STASH A FRAME into the dead task's slot at 100 Hz, so any post-mortem
+    //    `snapshot` would read a bogus frame.
+    //
+    // Order matters: lower the fence FIRST (with IF still off it cannot race
+    // the stub), then cli, then halt. No IRQ path runs after this point.
+    crate::preempt::set_preemptible(false);
     x86_64::instructions::interrupts::disable();
     loop {
         x86_64::instructions::hlt();

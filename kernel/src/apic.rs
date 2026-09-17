@@ -419,16 +419,21 @@ pub fn promote() -> Result<(), &'static str> {
     // Mask IRQ0 (timer), keep IRQ1 (keyboard): read the live masks and
     // set bit 0 of the master.
     //
-    // NOTE on the read-modify-write window: this runs with IF=1, so IRQ0
-    // can fire between `read_masks` and `write_masks` — the handler takes
-    // the same lock, EOIs, and releases. That interleaving is harmless:
-    // EOI never touches masks, so the worst case is one extra PIT tick
-    // before the mask lands. No lost state, no corruption.
-    unsafe {
+    // CRITICAL: the read-modify-write runs with INTERRUPTS DISABLED.
+    // `PICS` is a `spin::Mutex`, which is not interrupt-safe, and this
+    // function is called with IF=1 and IRQ0 still unmasked. If the PIT fired
+    // between `lock()` and the guard's drop, `timer_handler` would call
+    // `PICS.lock()` on the SAME CPU and spin forever waiting for a lock that
+    // the interrupted code can never release — a single-CPU deadlock that
+    // never even reaches the EOI, so the PIC then stops delivering anything.
+    // (The old code argued the interleaving was harmless because "EOI never
+    // touches masks" — true, and irrelevant: the lock, not the mask, is what
+    // deadlocks.) `without_interrupts` closes the window completely.
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
         let mut pics = crate::interrupts::PICS.lock();
         let masks = pics.read_masks();
         pics.write_masks(masks[0] | 0x01, masks[1]);
-    }
+    });
     crate::serial_println!("apic-timer: promoted to master clock (PIC IRQ0 masked, IRQ1 kept)");
     Ok(())
 }
@@ -441,10 +446,16 @@ pub fn promote() -> Result<(), &'static str> {
 pub fn rollback_to_pit() {
     // SAFETY: same contract as `promote` — mask bit 0 → 0 on the master
     // PIC, everything else untouched.
-    unsafe {
+    //
+    // Same lock discipline as `promote`: `PICS` is a non-interrupt-safe
+    // spinlock and IRQ0 may be live here, so the read-modify-write runs with
+    // interrupts disabled (a PIT tick landing inside the window would spin
+    // for a lock the interrupted code still holds — see the note in
+    // `promote`). The callers (`main`'s rollback) run with IF=1.
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
         let mut pics = crate::interrupts::PICS.lock();
         let masks = pics.read_masks();
         pics.write_masks(masks[0] & !0x01, masks[1]);
-    }
+    });
     crate::serial_println!("apic-timer: ROLLED BACK to PIT (IRQ0 unmasked)");
 }

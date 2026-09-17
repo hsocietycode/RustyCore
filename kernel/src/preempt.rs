@@ -17,13 +17,16 @@
 //! - NO `call` inside the stub: SysV alignment at IRQ entry is arbitrary
 //!   (mid-step compiler state minus 24 bytes of HW push), so a `call` would
 //!   need an explicit `and rsp,-16` dance with fixup math that forgets bytes.
-//!   The stub is pure asm end-to-end; the driver and the Rust side read the
-//!   static slots afterwards with the fence down.
-//! - Cross-task resume (skip the cooperative driver entirely) is the next
-//!   increment: a ring-0 `iretq` does NOT restore RSP, so resuming a DIFFERENT
-//!   task's frame needs an explicit `mov rsp, [frame.rsp]` over that task's own
-//!   stack. Today the stub proves save/restore on the SAME task — every offset,
-//!   the table indexing, and the register round-trip are exercised for real.
+//!   The stub is pure asm end-to-end; the Rust side reads the static slots
+//!   through [`snapshot`] / [`frame_ok`] with the fence down.
+//! - Cross-task resume (skip the cooperative driver entirely) is the NEXT
+//!   increment (Step 5b, see `docs/preemption.md`): a ring-0 `iretq` does NOT
+//!   restore RSP, so resuming a DIFFERENT task's frame needs an explicit
+//!   `mov rsp, [frame.rsp]` over that task's own stack. TODAY the stub proves
+//!   save/restore on the SAME task — every offset, the table indexing, and the
+//!   register round-trip are exercised for real, and Step 5a's slot identity
+//!   (`TASK_PTRS` + `SLOT_BOUNDS`) already records everything that switch arm
+//!   will need to validate a foreign frame.
 //! - `PREEMPTIBLE` fence: `1` only inside the trampoline's step window
 //!   (after `sti`, before the yield `cli`). The stub checks it first — if the
 //!   CPU is on the boot stack, in the driver, or mid-switch, nothing is
@@ -117,9 +120,26 @@ impl FullFrame {
         magic: 0,
     };
 
-    /// Fresh-task frame: first `iretq` lands in `entry` with `stack_top` as
-    /// RSP, IF=1 (0x202 = IF + reserved bit 1, which must stay set).
+    /// Fresh-task frame: the first `iretq` lands in `entry` with IF=1
+    /// (0x202 = IF + reserved bit 1, which must stay set).
+    ///
+    /// `stack_top` is the 16-aligned top of the task's stack; the RSP this
+    /// frame restores is `stack_top - 8`, NOT `stack_top`. The reason is the
+    /// same ABI parity [`crate::task::init_task_context`] fights for: a
+    /// function is entered with `rsp % 16 == 8` (the state right after a
+    /// `call` pushed its return address), and an `iretq` into a fresh frame
+    /// pushes NOTHING — so the frame must supply that missing 8 bytes by
+    /// pointing 8 below the aligned top. An `rsp % 16 == 0` entry into the
+    /// trampoline is a silent misalignment of every 16-byte SSE spill in the
+    /// task's whole call chain (and the trampoline's own entry assert would
+    /// fire on it, loudly, on the first Step-5b cross-task resume).
     pub fn fresh(entry: u64, cs: u16, stack_top: u64) -> Self {
+        assert_eq!(
+            stack_top % 16,
+            0,
+            "fresh preempt frame needs a 16-aligned stack top (got {stack_top:#x})"
+        );
+        let rsp = stack_top - 8;
         Self {
             r15: 0,
             r14: 0,
@@ -136,7 +156,7 @@ impl FullFrame {
             rdx: 0,
             rcx: 0,
             rax: 0,
-            rsp: stack_top,
+            rsp,
             rip: entry,
             cs: cs as u64,
             rflags: 0x202,
@@ -145,9 +165,11 @@ impl FullFrame {
     }
 
     /// Validate before `iretq`: magic intact, RSP canonical + in the task's
-    /// `[bottom, top]` window (top INCLUSIVE — a fresh frame's rsp IS the
-    /// stack top; nothing pushed yet). Returns `false` → halt loudly, never
-    /// `iretq` into garbage.
+    /// `[bottom, top]` window. `top` is INCLUSIVE and `bottom` too: a task
+    /// legitimately touches both edges (a fresh frame's rsp is `top - 8`, and
+    /// the canary lives at `bottom`), so an exclusive bound would reject a
+    /// perfectly good frame. Returns `false` → halt loudly, never `iretq` into
+    /// garbage.
     pub fn valid_for(&self, bottom: u64, top: u64) -> bool {
         if self.magic != PREEMPT_MAGIC {
             return false;
@@ -193,8 +215,10 @@ const HW_WORDS: usize = 3;
 const DOWN_WORDS: usize = 2;
 
 /// Byte offset of one frame inside [`TASK_FRAMES`]. Derived from the type —
-/// the stub's `imul rax, rax, 0xa0` is guarded by the assert below, so a
-/// struct change can never silently desync the indexing.
+/// the stub indexes the table with `imul rax, rax, {stride}`, and the const
+/// assert above ties `size_of::<FullFrame>()` to the spill math the stub
+/// performs, so a struct change can never silently desync the indexing
+/// (today: 20 words = 160 bytes = 0xA0).
 const FRAME_STRIDE: u64 = core::mem::size_of::<FullFrame>() as u64;
 
 /// Static task table: the IRQ-visible scheduling state. Fixed slots, indexed
@@ -354,22 +378,26 @@ pub fn snapshot(idx: usize) -> FullFrame {
 /// No prologue, no Rust, no `call` — pure asm. Ring-0 IRQ = 3 HW words only
 /// (rip/cs/rflags — no rsp/ss, no error code).
 ///
-/// THIS INCREMENT (part 2): same-task save/restore. When the fence is up, the
-/// stub spills 15 GPRs, STASHES the full frame into `TASK_FRAMES[CURRENT_IDX]`
-/// (proof the table + offsets are correct — a later part reads it back), EOI's,
-/// RESTORES the 15 GPRs, and `iretq`s to the SAME rip the CPU pushed. The
-/// yanked task resumes exactly where it was. `PREEMPT_SWITCHES` counts every
-/// yank that landed on a preemptible task — >0 proves the timer→stub→resume
-/// path is live and the frame didn't corrupt the task.
+/// THIS INCREMENT (part 2): same-task save/restore. When the fence is up and
+/// the current index names an occupied slot, the stub spills 15 GPRs, STASHES
+/// the full frame into `TASK_FRAMES[CURRENT_IDX]` (the table + offset math
+/// proven for real — Step 5a reads it back through [`frame_ok`] on every
+/// schedule), EOI's, RESTORES the 15 GPRs, and `iretq`s to the SAME rip the
+/// CPU pushed. The yanked task resumes exactly where it was. The jump to `2f`
+/// (skip the stash, still EOI + `iretq`) is taken when the fence is down or
+/// the slot is unoccupied: the boot stack, the driver, and mid-switch states
+/// are never stashed. `PREEMPT_SWITCHES` counts every yank that landed on a
+/// registered preemptible task — >0 proves the timer→stub→resume path is live
+/// and the frame didn't corrupt the task.
 ///
 /// WHY NOT cross-task YET: ring-0 `iretq` does NOT restore RSP (no privilege
 /// change → no SS/RSP pop). Resuming a DIFFERENT task's frame from a static
-/// slot would leave RSP pointing inside the table, not at the task's real
-/// stack — a triple fault. Part 3 restores RSP explicitly (`mov rsp,
-/// [frame.rsp]` over the task's own stack where the HW frame still lives),
-/// which needs the spill to stay on-stack, not copied to a slot. The stash
-/// here is the bridge: it proves the table + offset math is right so part 3
-/// only swaps the resume source, not the save math.
+/// slot would leave RSP pointing at the stub's own spill, not at the task's
+/// real stack — a triple fault. Step 5b restores RSP explicitly (`mov rsp,
+/// [frame.rsp]`), which is exactly what `FullFrame.rsp` already stores (the
+/// pre-IRQ rsp, i.e. the address above the CPU's 3 hw words). The stash here
+/// is the bridge: it proves the table + offset math is right so Step 5b only
+/// swaps the resume source, not the save math.
 #[unsafe(naked)]
 pub unsafe extern "C" fn lapic_preempt_stub() {
     naked_asm!(

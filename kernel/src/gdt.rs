@@ -24,7 +24,21 @@ pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 /// a double fault can fire before memory init, so this must not depend on
 /// the allocator).
 const DF_STACK_SIZE: usize = 4096 * 5;
-static mut DF_STACK: [u8; DF_STACK_SIZE] = [0; DF_STACK_SIZE];
+
+/// The IST stack, wrapped so its address is 16-byte aligned.
+///
+/// The wrapper is load-bearing, not tidiness: `[u8; N]` has alignment 1, so
+/// the CPU would take an arbitrary address as our double-fault stack top and
+/// push its frame (5 words on a double fault — rip/cs/rflags + the error
+/// code + padding, and MORE if the fault happened at a lower privilege)
+/// from there. A misaligned top misaligns every frame the handler then
+/// builds on that stack, which is the classic way a fault handler turns one
+/// fault into a triplet when it touches SSE state. `repr(align(16))` makes
+/// the top a multiple of 16 by construction.
+#[repr(align(16))]
+struct DoubleFaultStack([u8; DF_STACK_SIZE]);
+
+static mut DF_STACK: DoubleFaultStack = DoubleFaultStack([0; DF_STACK_SIZE]);
 
 /// The one TSS. `static mut` + `TSS::new()` (a `const fn`) — no `lazy_static`
 /// and, crucially, no `&raw mut` derived from a SHARED reference: writing
@@ -47,9 +61,18 @@ fn init_tss_fields() {
     // concurrently), and `DF_STACK` is a static the kernel owns exclusively.
     unsafe {
         let tss = &raw mut TSS;
-        let stack_start = VirtAddr::from_ptr(&raw const DF_STACK);
-        (*tss).interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
-            stack_start + DF_STACK_SIZE as u64;
+        // `&raw const DF_STACK.0` names the ARRAY itself rather than relying on
+        // repr(Rust) putting a one-field struct's field at offset 0, and the
+        // array inherits the wrapper's 16-byte alignment. DF_STACK_SIZE is a
+        // multiple of 16, so the top the CPU loads stays 16-aligned.
+        let stack_start = VirtAddr::from_ptr(&raw const DF_STACK.0);
+        let top = stack_start + DF_STACK_SIZE as u64;
+        debug_assert_eq!(
+            top.as_u64() % 16,
+            0,
+            "double-fault IST top must be 16-aligned"
+        );
+        (*tss).interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = top;
     }
 }
 
@@ -59,12 +82,17 @@ lazy_static! {
         let mut gdt = GlobalDescriptorTable::new();
         let code_selector = gdt.append(Descriptor::kernel_code_segment());
         let data_selector = gdt.append(Descriptor::kernel_data_segment());
-        // SAFETY: `TSS` is a live static; the descriptor only records its
-        // address and length, so it stays valid for the whole boot. The
-        // reference is transient (the descriptor is returned by value) and
-        // read-only — the raw pointer keeps us off `&TSS` (static-mut-refs).
+        // SAFETY: `TSS` is a live static (valid for the whole boot, and the
+        // descriptor outlives nothing), and `tss_segment_unchecked` takes the
+        // raw pointer directly — no `&'static TaskStateSegment` is ever
+        // formed. That distinction is the whole point: `Descriptor::tss_segment`
+        // would hand out a SHARED reference to this `static mut`, and
+        // `set_rsp0` later writes through `&raw mut TSS`. A shared reference to
+        // a place that gets mutated is aliasing UB — benign-looking, invisible
+        // in a debug build, and exactly the class of bug this file's header
+        // says it refuses to accept.
         let tss_ptr: *const TaskStateSegment = &raw const TSS;
-        let tss_selector = gdt.append(unsafe { Descriptor::tss_segment(&*tss_ptr) });
+        let tss_selector = gdt.append(unsafe { Descriptor::tss_segment_unchecked(tss_ptr) });
         (
             gdt,
             Selectors {

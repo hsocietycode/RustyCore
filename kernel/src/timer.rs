@@ -27,6 +27,18 @@ pub fn init() {
         Port::<u8>::new(PIT_CH0).write((divisor >> 8) as u8);
 
         // Unmask IRQ0 (timer) only: master mask bit 0 → 0, rest stay masked.
+        //
+        // This takes the `PICS` spinlock, which is NOT interrupt-safe (see
+        // the long note in `apic::promote`). It is safe HERE only because
+        // main calls `timer::init` with IF=0, before it ever enables
+        // interrupts — so IRQ0 cannot fire inside this window and cannot try
+        // to take the lock on the same CPU. The `debug_assert` pins that
+        // precondition down instead of leaving it to a comment a future
+        // caller could invalidate by moving one line.
+        debug_assert!(
+            !x86_64::instructions::interrupts::are_enabled(),
+            "timer::init must run with interrupts disabled (PICS lock is not IRQ-safe)"
+        );
         let mut pics = crate::interrupts::PICS.lock();
         let mut masks = pics.read_masks();
         masks[0] &= !0x01;

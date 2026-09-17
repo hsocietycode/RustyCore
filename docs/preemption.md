@@ -57,5 +57,18 @@ with a live `iretq` tail.
 5. **Guards.** Before `iretq`: magic, canonical rsp, `rsp` inside the slot's
    recorded window, and `cs` equal to the kernel code selector.
 
+### ABI parity applies to `FullFrame` too
+
+`iretq` restores `rsp` verbatim and pushes nothing, whereas a task that is
+entered by `call` inherits the `rsp % 16 == 8` the pushed return address left
+behind. So a *fresh* frame must carry `rsp = stack_top - 8`, not
+`stack_top` — otherwise the very first cross-task resume enters the
+trampoline at `rsp % 16 == 0`, which misaligns every 16-byte SSE spill in the
+task's call chain (and trips the trampoline's own entry assert, loudly).
+`FullFrame::fresh` asserts the 16-aligned `stack_top` and subtracts the 8
+itself, so the invariant lives in one place instead of at every call site.
+Corollary: frames stashed by the *stub* need no such fixup — they record the
+interrupted `rsp` exactly as it was, alignment and all.
+
 Each of these is independently testable, which is why they land one at a time
 with a boot proof rather than as one big switch.
